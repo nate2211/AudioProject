@@ -23,6 +23,7 @@ import requests
 import sounddevice as sd
 import soundfile as sf
 import threading
+import stream
 
 from filters import available_filters as AF_AVAILABLE, build_filter as AF_BUILD, AudioFilter
 import warps  # noqa: F401

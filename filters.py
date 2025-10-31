@@ -5,6 +5,7 @@
 # =============================
 from __future__ import annotations
 
+import math
 from typing import Callable, Dict, Tuple, Any, Optional, List
 from dataclasses import dataclass
 import numpy as np
@@ -54,7 +55,84 @@ _DEF_EPS = 1e-12
 def _db_to_lin(db: float) -> float:
     return float(10 ** (db / 20.0))
 
+def _biquad_to_sos(b0: float, b1: float, b2: float, a0: float, a1: float, a2: float) -> np.ndarray:
+    """
+    Normalize a0 to 1 and return a (1,6) SOS row for scipy.signal.sosfilt:
+    [b0, b1, b2, a0, a1, a2] with a0 == 1.
+    """
+    if a0 == 0.0:
+        a0 = 1e-12
+    b0n, b1n, b2n = b0 / a0, b1 / a0, b2 / a0
+    a1n, a2n = a1 / a0, a2 / a0
+    sos = np.array([[b0n, b1n, b2n, 1.0, a1n, a2n]], dtype=np.float64)
+    return sos
 
+def _safe_norm_freq(sr: int, f0: float) -> float:
+    """Return normalized radian freq w0 = 2π f0 / sr, clamped to (0, π)."""
+    f0 = float(max(1e-3, min(f0, 0.5 * sr * 0.999)))  # keep shy of Nyquist
+    return 2.0 * math.pi * (f0 / sr)
+
+def _iir_peaking_sos(sr: int, f0: float, Q: float, gain_db: float) -> np.ndarray:
+    """
+    Peaking EQ (RBJ). Positive gain_db boosts; negative cuts.
+    Returns a single-section SOS of shape (1, 6).
+    """
+    Q = float(max(1e-6, Q))
+    A = 10.0 ** (gain_db / 40.0)  # amplitude (not power)
+    w0 = _safe_norm_freq(sr, f0)
+    cw = math.cos(w0)
+    sw = math.sin(w0)
+    alpha = sw / (2.0 * Q)
+
+    b0 = 1.0 + alpha * A
+    b1 = -2.0 * cw
+    b2 = 1.0 - alpha * A
+    a0 = 1.0 + alpha / A
+    a1 = -2.0 * cw
+    a2 = 1.0 - alpha / A
+
+    return _biquad_to_sos(b0, b1, b2, a0, a1, a2)
+
+def _iir_shelf_sos(
+    sr: int,
+    f0: float,
+    gain_db: float,
+    *,
+    shelf_type: str = "low",
+    slope: float = 1.0
+) -> np.ndarray:
+    """
+    Low/High shelf (RBJ). 'slope' maps to RBJ's S (shelf slope, >0).
+    Returns a single-section SOS of shape (1, 6).
+    """
+    S = float(max(1e-6, slope))
+    A = 10.0 ** (gain_db / 40.0)
+    w0 = _safe_norm_freq(sr, f0)
+    cw = math.cos(w0)
+    sw = math.sin(w0)
+    # RBJ shelving alpha (note: sqrt term)
+    alpha = sw / 2.0 * math.sqrt((A + 1.0 / A) * (1.0 / S - 1.0) + 2.0)
+
+    if shelf_type.lower() in ("low", "lowshelf", "ls"):
+        # Low-shelf
+        b0 =    A * ((A + 1) - (A - 1) * cw + 2.0 * math.sqrt(A) * alpha)
+        b1 =  2*A * ((A - 1) - (A + 1) * cw)
+        b2 =    A * ((A + 1) - (A - 1) * cw - 2.0 * math.sqrt(A) * alpha)
+        a0 =        (A + 1) + (A - 1) * cw + 2.0 * math.sqrt(A) * alpha
+        a1 =   -2 * ((A - 1) + (A + 1) * cw)
+        a2 =        (A + 1) + (A - 1) * cw - 2.0 * math.sqrt(A) * alpha
+    elif shelf_type.lower() in ("high", "highshelf", "hs"):
+        # High-shelf
+        b0 =    A * ((A + 1) + (A - 1) * cw + 2.0 * math.sqrt(A) * alpha)
+        b1 = -2*A * ((A - 1) + (A + 1) * cw)
+        b2 =    A * ((A + 1) + (A - 1) * cw - 2.0 * math.sqrt(A) * alpha)
+        a0 =        (A + 1) - (A - 1) * cw + 2.0 * math.sqrt(A) * alpha
+        a1 =    2 * ((A - 1) - (A + 1) * cw)
+        a2 =        (A + 1) - (A - 1) * cw - 2.0 * math.sqrt(A) * alpha
+    else:
+        raise ValueError(f"Unknown shelf_type '{shelf_type}' (use 'low' or 'high').")
+
+    return _biquad_to_sos(b0, b1, b2, a0, a1, a2)
 # ---------- Filters ----------
 @register_filter("gain", help="Linear/dB gain. Params: db (0), lin (None)")
 class Gain(AudioFilter):
