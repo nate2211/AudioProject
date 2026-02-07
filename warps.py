@@ -579,10 +579,31 @@ class SpeedResample(AudioFilter):
         if self.rate <= 0:
             raise ValueError("speed.rate must be positive.")
 
-        q = str(params.get("quality", "kaiser_best")).lower()
-        if q not in ("kaiser_best", "kaiser_fast"):
-            raise ValueError("speed.quality must be 'kaiser_best' or 'kaiser_fast'.")
-        self.quality = q
+        q = params.get("quality", "kaiser_best")
+
+        # Convert q into a SciPy window spec tuple ("kaiser", beta)
+        if isinstance(q, (int, float)):
+            beta = float(q)
+        elif isinstance(q, str):
+            ql = q.strip().lower()
+            if ql in ("kaiser_best", "best"):
+                beta = 14.0
+            elif ql in ("kaiser_fast", "fast"):
+                beta = 8.0
+            else:
+                # allow numeric string like "8" or "14"
+                try:
+                    beta = float(ql)
+                except Exception:
+                    raise ValueError(
+                        "speed.quality must be 'kaiser_best', 'kaiser_fast', or a numeric beta (e.g. 8 or 14)")
+        else:
+            raise ValueError("speed.quality invalid type")
+
+        # clamp beta to sane range
+        beta = float(min(max(beta, 0.0), 32.0))
+
+        self._window = ("kaiser", beta)
 
         self.clamp = float(params.get("clamp", 1.05))
         self.prefilter = bool(params.get("prefilter", True))
@@ -630,10 +651,9 @@ class SpeedResample(AudioFilter):
 
         frac = Fraction(self.rate).limit_denominator(10000)
         up, down = frac.numerator, frac.denominator
-
         chans = []
         for c in range(xb.shape[1]):
-            y = signal.resample_poly(xb[:, c], up, down, window=self.quality)
+            y = signal.resample_poly(xb[:, c], up, down, window=self._window)
             chans.append(y.astype(_F32)[:, None])
         yb = np.concatenate(chans, axis=1)
 
@@ -648,3 +668,7 @@ class SpeedResample(AudioFilter):
             self._carry = np.zeros((0, self._carry.shape[1]), dtype=_F32)
         self._zi = None
         return None
+
+
+
+

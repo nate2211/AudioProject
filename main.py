@@ -23,13 +23,18 @@ import requests
 import sounddevice as sd
 import soundfile as sf
 import threading
+
+from PyQt6.QtWidgets import QApplication
+
 import stream
 
 from filters import available_filters as AF_AVAILABLE, build_filter as AF_BUILD, AudioFilter
 import warps  # noqa: F401
 import clarity
-log = logging.getLogger("audiogen")
+from gui import FLStudioGUI
 
+log = logging.getLogger("audiogen")
+import scipy.stats
 # ---------------- Small DSP helpers ----------------
 
 def _db_to_lin(db: float) -> float:
@@ -1079,6 +1084,25 @@ def build_and_run(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
     return args.func(args)
+def launch_gui():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    gui = FLStudioGUI()
+    gui.show()
+    sys.exit(app.exec())
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(build_and_run())
+def launch_cli():
+    # If you still have argparse-based commands elsewhere, call it here.
+    # Example:
+    # from cli import main_cli
+    # main_cli()
+    raise SystemExit("CLI mode not wired yet")  # remove when you wire it
+
+if __name__ == "__main__":
+    # If you run EXE with no args (double click), start GUI.
+    if len(sys.argv) <= 1:
+        launch_gui()
+    else:
+        # If you want BOTH GUI + CLI, keep this.
+        # If you want GUI always, just call launch_gui() always.
+        launch_cli()
