@@ -46,4 +46,4 @@ An ultra-low-artifact, streaming-capable audio workstation and processing engine
 
 ### Running the App
 ```bash
-python main.py
+python gui.py
