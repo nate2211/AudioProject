@@ -25,13 +25,13 @@ from helpers import FixedBlockAdapter, DCBlocker, SoftClipper, Limiter
 from filters import available_filters, build_filter  # FX rack; SYNC/WSOLA is self-contained
 
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QThread, QRectF
-from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QCursor
+from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QCursor, QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
     QPushButton, QLabel, QSlider, QScrollArea, QComboBox, QGroupBox,
     QFileDialog, QFormLayout, QDialog, QDialogButtonBox, QCheckBox,
     QProgressBar, QInputDialog, QDoubleSpinBox, QMessageBox,
-    QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsSimpleTextItem
+    QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsSimpleTextItem,QSplitter,
 )
 
 # Optional: YouTube support
@@ -40,23 +40,66 @@ try:
 except Exception:
     yt_dlp = None
 
-
+def _ffmpeg_runs(ffmpeg_path: str) -> bool:
+    try:
+        p = subprocess.run(
+            [ffmpeg_path, "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+        return p.returncode == 0
+    except Exception:
+        return False
 # =============================================================================
 # FFmpeg PATH + pydub safety pointers
 # =============================================================================
 
 def get_ffmpeg_bin_dir() -> str:
-    # sys._MEIPASS is the temp folder where PyInstaller extracts files
-    if hasattr(sys, '_MEIPASS'):
-        return sys._MEIPASS
+    """
+    Search order:
+      1) PyInstaller onefile extraction dir (_MEIPASS)
+      2) ffmpeg(.exe) next to this script OR in ./bin next to it
+      3) Environment PATH (shutil.which)
+      4) Your dev fallback path
+      5) Last fallback: this script directory (even if ffmpeg isn't there)
+    Returns: directory containing ffmpeg executable (preferred), or script dir as last resort.
+    """
 
-    # Fallback for development (your local path)
+    exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+
+    def dir_has_ffmpeg(d: Path) -> bool:
+        p = d / exe_name
+        return p.exists() and _ffmpeg_runs(str(p))
+
+    # 1) PyInstaller
+    if hasattr(sys, "_MEIPASS"):
+        meipass = Path(sys._MEIPASS)
+        if dir_has_ffmpeg(meipass):
+            return str(meipass)
+        if dir_has_ffmpeg(meipass / "bin"):
+            return str(meipass / "bin")
+
+    # 2) Same directory as this file (or ./bin)
+    here = Path(__file__).resolve().parent
+    if dir_has_ffmpeg(here):
+        return str(here)
+    if dir_has_ffmpeg(here / "bin"):
+        return str(here / "bin")
+
+    # 3) PATH variable (system/global ffmpeg)
+    w = shutil.which(exe_name)
+    if w and _ffmpeg_runs(w):
+        return str(Path(w).resolve().parent)
+
+    # 4) Dev fallback
     dev_path = Path(r"C:\Users\natem\PycharmProjects\audioProject\ffmpeg-8.0-essentials_build\bin")
-    if dev_path.exists():
+    if dir_has_ffmpeg(dev_path):
         return str(dev_path)
 
-    # Final fallback: current script directory
-    return os.path.dirname(os.path.abspath(__file__))
+    # 5) Last fallback (keeps your old behavior)
+    return str(here)
 
 ffmpeg_bin_path = get_ffmpeg_bin_dir()
 
@@ -2545,10 +2588,16 @@ class FLStudioGUI(QMainWindow):
 
         main_layout.addWidget(top_bar)
 
-        workspace = QHBoxLayout()
+        # ---------- RESIZABLE WORKSPACE (Splitters) ----------
+        # Horizontal: Filters | (Sequencer+Tracks) | Parameters
+        h_split = QSplitter(Qt.Orientation.Horizontal)
+        h_split.setChildrenCollapsible(False)
+        h_split.setHandleWidth(6)
+        h_split.setStyleSheet("QSplitter::handle { background:#111; }")
 
+        # ========== LEFT: Filters ==========
         mixer_box = QGroupBox("Filters")
-        mixer_box.setFixedWidth(220)
+        mixer_box.setMinimumWidth(180)
         mixer_box.setStyleSheet("background:#000; color:#eee; font-weight:bold; border:1px solid #222;")
         mixer_layout = QVBoxLayout(mixer_box)
 
@@ -2560,24 +2609,31 @@ class FLStudioGUI(QMainWindow):
             mixer_layout.addWidget(slot)
             self.fx_slots.append(slot)
 
-        workspace.addWidget(mixer_box)
+        mixer_layout.addStretch(1)
+        h_split.addWidget(mixer_box)
 
-        right_col = QVBoxLayout()
+        # ========== MIDDLE: Sequencer + Tracks Dock (vertical splitter) ==========
+        mid_split = QSplitter(Qt.Orientation.Vertical)
+        mid_split.setChildrenCollapsible(False)
+        mid_split.setHandleWidth(6)
+        mid_split.setStyleSheet("QSplitter::handle { background:#111; }")
 
+        # Sequencer container
         seq_box = QGroupBox("Sequencer (FL-ish)")
+        seq_box.setMinimumHeight(240)
         seq_box.setStyleSheet("background:#000; color:#aaa; font-weight:bold; border:1px solid #222;")
         seq_layout = QVBoxLayout(seq_box)
 
         self.sequencer = SequencerView(self.engine)
         self.sequencer.clip_selected.connect(self.on_clip_selected)
         self.sequencer.clips_changed.connect(self._arrangement_changed)
-        self.sequencer.setMinimumHeight(340)
-
         seq_layout.addWidget(self.sequencer)
-        right_col.addWidget(seq_box)
 
+        mid_split.addWidget(seq_box)
+
+        # Tracks dock container
         dock_box = QGroupBox("Audio Dock (Tracks)")
-        dock_box.setFixedHeight(320)
+        dock_box.setMinimumHeight(140)
         dock_box.setStyleSheet("background:#000; color:#777; font-weight:bold; border:1px solid #222;")
         self.dock_layout = QVBoxLayout(dock_box)
 
@@ -2589,10 +2645,20 @@ class FLStudioGUI(QMainWindow):
         self.dock_inner.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.dock_scroll.setWidget(self.dock_container)
         self.dock_layout.addWidget(self.dock_scroll)
-        right_col.addWidget(dock_box)
 
+        mid_split.addWidget(dock_box)
+
+        # Give sequencer more space than dock by default
+        mid_split.setStretchFactor(0, 4)
+        mid_split.setStretchFactor(1, 1)
+
+        h_split.addWidget(mid_split)
+
+        # ========== RIGHT: Parameters ==========
         inspector_box = QGroupBox("Parameters")
+        inspector_box.setMinimumWidth(260)
         inspector_box.setStyleSheet("background:#000; color:#00ff00; font-weight:bold; border:1px solid #222;")
+
         self.param_scroll = QScrollArea()
         self.param_scroll.setWidgetResizable(True)
         self.param_scroll.setStyleSheet("background:#000; border:none;")
@@ -2600,12 +2666,22 @@ class FLStudioGUI(QMainWindow):
         self.param_layout = QVBoxLayout(self.param_container)
         self.param_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.param_scroll.setWidget(self.param_container)
+
         ins_layout = QVBoxLayout(inspector_box)
         ins_layout.addWidget(self.param_scroll)
-        right_col.addWidget(inspector_box)
 
-        workspace.addLayout(right_col, 1)
-        main_layout.addLayout(workspace)
+        h_split.addWidget(inspector_box)
+
+        # Stretch: Filters small, middle big, parameters medium
+        h_split.setStretchFactor(0, 0)
+        h_split.setStretchFactor(1, 4)
+        h_split.setStretchFactor(2, 1)
+
+        # Optional: initial sizes (pixels). Tune to taste.
+        h_split.setSizes([220, 900, 330])
+
+        main_layout.addWidget(h_split, 1)
+        # ---------- END RESIZABLE WORKSPACE ----------
 
         self.meter_l = QProgressBar()
         self.meter_r = QProgressBar()
@@ -3246,5 +3322,11 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     gui = FLStudioGUI()
+    screen = QGuiApplication.primaryScreen()
+    avail = screen.availableGeometry()  # excludes taskbar
+    w = min(gui.width(), avail.width())
+    h = min(gui.height(), avail.height())
+    gui.resize(w, h)
+    gui.move(avail.left(), avail.top())
     gui.show()
     sys.exit(app.exec())
