@@ -73,6 +73,16 @@ def get_ffmpeg_bin_dir() -> str:
         p = d / exe_name
         return p.exists() and _ffmpeg_runs(str(p))
 
+    def _find_on_path_dir(exe_name: str) -> str | None:
+        path_env = os.environ.get("PATH", "")
+        for d in path_env.split(os.pathsep):
+            if not d:
+                continue
+            cand = os.path.join(d, exe_name)
+            if os.path.isfile(cand) and _ffmpeg_runs(cand):
+                return d  # the PATH directory that contains the exe
+        return None
+
     # 1) PyInstaller
     if hasattr(sys, "_MEIPASS"):
         meipass = Path(sys._MEIPASS)
@@ -89,10 +99,9 @@ def get_ffmpeg_bin_dir() -> str:
         return str(here / "bin")
 
     # 3) PATH variable (system/global ffmpeg)
-    w = shutil.which(exe_name)
-    if w and _ffmpeg_runs(w):
-        return str(Path(w).resolve().parent)
-
+    ffmpeg_dir = _find_on_path_dir(exe_name)
+    if ffmpeg_dir:
+        return ffmpeg_dir
     # 4) Dev fallback
     dev_path = Path(r"C:\Users\natem\PycharmProjects\audioProject\ffmpeg-8.0-essentials_build\bin")
     if dir_has_ffmpeg(dev_path):
