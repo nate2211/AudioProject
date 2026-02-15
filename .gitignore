@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# JetBrains / IDE
+.idea/
+.vscode/
+
+# Build outputs
+build/
+dist/
+*.spec
+
+# Local artifacts / caches
+*.log
+*.tmp
+
+# Audio exports (you listed a bunch)
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# OS
+.DS_Store
+Thumbs.db
