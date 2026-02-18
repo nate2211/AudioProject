@@ -1,4 +1,4 @@
-# Gemini Audio Engine Pro
+# Nate's Audio Engine Pro
 <img width="1906" height="990" alt="Screenshot 2026-02-16 221115" src="https://github.com/user-attachments/assets/21907c3b-1473-401e-ba5e-6e18e0d7af7c" />
 
 An ultra-low-artifact, streaming-capable audio workstation and processing engine. **Gemini Audio Pro** combines a high-performance Python DSP backend with an FL Studio-inspired sequencer for real-time manipulation, time-stretching, and spectral processing.
