@@ -110,8 +110,17 @@ def _add_tpdf_dither_inplace(x: np.ndarray, level: float = 1e-5) -> None:
 
 def setup_logging(verbosity: int = 0) -> None:
     level = [logging.WARNING, logging.INFO, logging.DEBUG][min(verbosity, 2)]
-    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%H:%M:%S")
 
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    # Optional: ensure handler isn't filtering
+    for h in logging.getLogger().handlers:
+        h.setLevel(level)
 # ---------------- File fetcher ----------------
 
 class FileFetcher:
@@ -536,7 +545,26 @@ def cmd_stream(args: argparse.Namespace) -> int:
 
     in_dev = _resolve_device(args.in_device, "in", allow_render_for_loopback=bool(args.wasapi_loopback))
     out_dev = _resolve_device(args.out_device, "out", allow_render_for_loopback=False)
+    # --- NEW: Dynamically detect maximum channels to prevent PaErrorCode -9998 ---
+    # --- Clamp requested channels to what the devices support (DON'T force max) ---
+    try:
+        in_info = sd.query_devices(in_dev)
+        out_info = sd.query_devices(out_dev)
 
+        max_in = int(in_info.get("max_input_channels", 0) or 0)
+        max_out = int(out_info.get("max_output_channels", 0) or 0)
+
+        req_in, req_out = int(in_channels), int(out_channels)
+
+        if max_in > 0 and req_in > max_in:
+            log.warning("Clamping input channels %d -> %d (device max=%d)", req_in, max_in, max_in)
+            in_channels = max_in
+
+        if max_out > 0 and req_out > max_out:
+            log.warning("Clamping output channels %d -> %d (device max=%d)", req_out, max_out, max_out)
+            out_channels = max_out
+    except Exception as e:
+        log.warning("Could not query device channels, leaving requested values: %s", e)
     # Preflight checks (skip input check when loopback; we probe it ourselves)
     if not args.wasapi_loopback:
         try:
@@ -559,14 +587,22 @@ def cmd_stream(args: argparse.Namespace) -> int:
     hard_limit = bool(args.hard_limit)
 
     # DC blocker instance (per stream)
+    # DC blocker instance (per stream)
     dc_block = DCBlocker(cutoff_hz=20.0)
 
     def process_block(x: np.ndarray) -> np.ndarray:
+        frames = x.shape[0]
+
+        # 1. Safely upmix/downmix to max_ch for internal FX processing
         if x.shape[1] == max_ch:
-            np.copyto(scratch_mid[:, :max_ch], x)
-            cur = scratch_mid[:, :max_ch]
+            cur = x.copy()
+        elif x.shape[1] == 1 and max_ch > 1:
+            cur = np.tile(x, (1, max_ch))  # Safely duplicate 1 mic to all channels
         else:
-            cur = _upmix_mono_to_stereo(x, max_ch) if x.shape[1] == 1 else _downmix_to_n(x, max_ch)
+            # Handle arbitrary mismatched sizes
+            cur = np.zeros((frames, max_ch), dtype=np.float32)
+            take_c = min(x.shape[1], max_ch)
+            cur[:, :take_c] = x[:, :take_c]
 
         y = cur
         for f in filters:
@@ -574,15 +610,27 @@ def cmd_stream(args: argparse.Namespace) -> int:
 
         # DC-block + tiny TPDF dither before output gain/limiting
         y = dc_block.process(y, samplerate)
-        _add_tpdf_dither_inplace(y, level=1e-5)
 
+        # Dither level array size adjustment
+        d = (np.random.rand(y.size).astype(np.float32) - 0.5) * 2e-5
+        y += d.reshape(y.shape)
+
+        # 2. Map processed audio to the requested Output Channels (e.g., 16)
         if y.shape[1] != out_channels:
-            y = _upmix_mono_to_stereo(y, out_channels) if (y.shape[1] == 1 and out_channels > 1) else _downmix_to_n(y, out_channels)
+            if y.shape[1] == 1 and out_channels > 1:
+                y = np.tile(y, (1, out_channels))
+            elif y.shape[1] > out_channels:
+                y = y[:, :out_channels]
+            else:
+                out_arr = np.zeros((frames, out_channels), dtype=np.float32)
+                out_arr[:, :y.shape[1]] = y
+                y = out_arr
 
         if gain_lin != 1.0:
             np.multiply(y, gain_lin, out=y)
         if hard_limit:
-            _hard_clip_inplace(y, -1.0, 1.0)
+            np.clip(y, -1.0, 1.0, out=y)
+
         return y
 
     stop_event = threading.Event()
@@ -1033,33 +1081,44 @@ def cmd_stream(args: argparse.Namespace) -> int:
     log.info("Starting duplex: in=%s (%d ch) -> out=%s (%d ch) @ %d Hz, B=%d, latency=%s",
              str(in_dev), in_channels, str(out_dev), out_channels, samplerate, B, str(latency))
 
-    scratch_in = np.zeros((B, in_channels), dtype=np.float32)
-
     def duplex_cb(indata, outdata, frames, time_info, status):
         try:
             if status:
                 log.debug("Stream status: %s", status)
-            x = indata[:, :in_channels]
-            if frames != scratch_in.shape[0]:
-                x = x[:frames, :]
+
+            # Safely parse input
+            x = np.asarray(indata, dtype=np.float32)
+            if x.ndim == 1:
+                x = x[:, None]
+
+            # Process FX and Channel Routing
             y = process_block(x)
+
+            # Safely write to output device buffer
             n = min(frames, y.shape[0])
-            outdata[:n, :out_channels] = y[:n, :out_channels]
+            out_c = min(outdata.shape[1], y.shape[1])
+
+            outdata[:n, :out_c] = y[:n, :out_c]
+
+            # Zero-fill any remaining frames or unmapped channels to prevent garbled noise
             if n < frames:
-                outdata[n:, :out_channels].fill(0.0)
+                outdata[n:, :].fill(0.0)
+            if out_c < outdata.shape[1]:
+                outdata[:, out_c:].fill(0.0)
+
         except Exception as ex:
             log.exception("Duplex callback error: %s", ex)
             outdata.fill(0.0)
 
     try:
         with sd.Stream(
-            samplerate=samplerate,
-            blocksize=B,
-            latency=latency,
-            device=(in_dev, out_dev),
-            channels=(in_channels, out_channels),
-            dtype="float32",
-            callback=duplex_cb,
+                samplerate=samplerate,
+                blocksize=B,
+                latency=latency,
+                device=(in_dev, out_dev),
+                channels=(in_channels, out_channels),
+                dtype="float32",
+                callback=duplex_cb,
         ):
             log.info("Duplex active. Press Ctrl+C to stop.")
             while not stop_event.is_set():

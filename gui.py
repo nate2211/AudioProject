@@ -1356,7 +1356,44 @@ class AudioEngine(QObject):
     def stream_live(self, in_idx: int, out_idx: int, *, use_wasapi_loopback: bool = False):
         self._stop_event.clear()
         self.is_streaming = True
+        # ---- NEW: derive safe per-side channel counts ----
+        try:
+            in_info = sd.query_devices(in_idx)
+            out_info = sd.query_devices(out_idx)
 
+            # Loopback uses the *render* device's output channels
+            if use_wasapi_loopback:
+                # Require WASAPI device for loopback
+                apis = sd.query_hostapis()
+                api_name = apis[in_info["hostapi"]]["name"]
+                if "WASAPI" not in api_name:
+                    raise RuntimeError(f"Loopback requires a WASAPI device. Input idx={in_idx} is '{api_name}'. "
+                                       f"Select the WASAPI copy of your output device.")
+
+                in_max = int(in_info.get("max_output_channels", 0) or 0)
+                sr = int(in_info.get("default_samplerate") or self.master_sr)
+            else:
+                in_max = int(in_info.get("max_input_channels", 0) or 0)
+                sr = int(self.master_sr)
+
+            out_max = int(out_info.get("max_output_channels", 0) or 0)
+
+            if in_max < 1:
+                raise RuntimeError(f"Selected input device has 0 usable channels (idx={in_idx}). "
+                                   f"Pick an input-capable device (or a WASAPI render device for loopback).")
+            if out_max < 1:
+                raise RuntimeError(
+                    f"Selected output device has 0 output channels (idx={out_idx}). Pick another output device.")
+
+            # Your engine is “stereo-first”, so request up to 2 but never exceed device capability
+            in_ch = min(2, in_max)
+            out_ch = min(2, out_max)
+
+        except Exception as e:
+            print("[AudioEngine] stream_live device/channel setup error:", e)
+            self.is_streaming = False
+            self.finished.emit()
+            return
         extra = None
         if use_wasapi_loopback:
             try:
@@ -1450,7 +1487,7 @@ class AudioEngine(QObject):
             with sd.Stream(
                 device=(in_idx, out_idx),
                 samplerate=self.master_sr,
-                channels=2,
+                channels=(in_ch, out_ch),
                 callback=stream_callback,
                 dtype="float32",
                 blocksize=8192,
@@ -2491,7 +2528,7 @@ class ClipItem(QGraphicsRectItem):
 class FLStudioGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Gemini Audio Engine Pro (FL-ish Sequencer)")
+        self.setWindowTitle("Nate's Audio Engine Pro")
         self.resize(1450, 980)
         self.setStyleSheet("QMainWindow { background-color:#000; }")
 
@@ -3299,7 +3336,8 @@ class StreamConfigDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Stream Config")
-        self.setFixedWidth(420)
+        # Widened the dialog to accommodate the longer device strings
+        self.setFixedWidth(650)
         self.setStyleSheet("background:#111; color:#fff;")
 
         l = QFormLayout(self)
@@ -3307,13 +3345,34 @@ class StreamConfigDialog(QDialog):
         self.in_dev = QComboBox()
         self.out_dev = QComboBox()
 
+        # Ensure the dropdowns are wide enough
+        self.in_dev.setMinimumWidth(500)
+        self.out_dev.setMinimumWidth(500)
+
         devs = sd.query_devices()
+        apis = sd.query_hostapis()
+
         for i, d in enumerate(devs):
             name = d.get("name", f"Device {i}")
-            if d.get("max_input_channels", 0) > 0:
-                self.in_dev.addItem(name, i)
-            if d.get("max_output_channels", 0) > 0:
-                self.out_dev.addItem(name, i)
+
+            # Safely fetch Host API name
+            try:
+                api_idx = d.get("hostapi", 0)
+                api_name = apis[api_idx]["name"]
+            except Exception:
+                api_name = "Unknown API"
+
+            in_ch = d.get("max_input_channels", 0)
+            out_ch = d.get("max_output_channels", 0)
+            sr = int(d.get("default_samplerate", 0))
+
+            # Build a highly descriptive string for the UI
+            if in_ch > 0:
+                label_in = f"[{api_name}] {name}  ({in_ch} ch, {sr} Hz)"
+                self.in_dev.addItem(label_in, i)
+            if out_ch > 0:
+                label_out = f"[{api_name}] {name}  ({out_ch} ch, {sr} Hz)"
+                self.out_dev.addItem(label_out, i)
 
         self.wasapi = QCheckBox("WASAPI Loopback (Windows)")
 
