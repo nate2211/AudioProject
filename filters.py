@@ -518,11 +518,11 @@ class Bandpass(_IIRSOS):
 )
 class Compressor(AudioFilter):
     """
-    Stream-safe compressor, tuned to avoid "crackle" on fast UI updates:
-      - detector AR smoothing
-      - GR AR smoothing
-      - stereo link optional
-      - all math guarded against NaN/inf
+    Stream-safe compressor (fast path):
+      - NO per-sample numpy allocations
+      - envelope + GR smoothing kept
+      - optional stereo link
+      - guards against NaN/inf + denorm-ish tiny values
     """
     def __init__(self, params: Union[Dict[str, Any], None] = None, **kwargs: Any):
         p = dict(params or {})
@@ -537,12 +537,12 @@ class Compressor(AudioFilter):
 
         sl = p.get("stereo_link", True)
         if isinstance(sl, str):
-            self.stereo_link = sl.strip().lower() == "true"
+            self.stereo_link = sl.strip().lower() in ("1", "true", "yes", "on")
         else:
             self.stereo_link = bool(sl)
 
-        self._env: Optional[np.ndarray] = None
-        self._gr_db: Optional[np.ndarray] = None
+        self._env: Optional[np.ndarray] = None     # (C,)
+        self._gr_db: Optional[np.ndarray] = None   # (C,)
         self._sr: Optional[int] = None
 
         self._atk_a: float = 0.0
@@ -555,17 +555,37 @@ class Compressor(AudioFilter):
     def _alpha(ms: float, sr: int) -> float:
         sr = int(max(1, sr))
         ms = float(max(0.1, ms))
-        return float(np.exp(-1.0 / (ms * 1e-3 * sr)))
+        return float(math.exp(-1.0 / (ms * 1e-3 * sr)))
+
+    @staticmethod
+    def _soft_knee_gr_db_scalar(level_db: float, T: float, R: float, K: float) -> float:
+        # returns negative dB gain-reduction (0 = no GR)
+        over = level_db - T
+        if K <= 1e-6:
+            if over > 0.0:
+                return -(1.0 - 1.0 / R) * over
+            return 0.0
+
+        halfK = 0.5 * K
+        knee_start = T - halfK
+        knee_end = T + halfK
+
+        if level_db <= knee_start:
+            return 0.0
+        if level_db >= knee_end:
+            return -(1.0 - 1.0 / R) * over
+
+        knee_pos = level_db - knee_start
+        return -(1.0 - 1.0 / R) * (knee_pos * knee_pos) / (2.0 * K)
 
     def set_params(self, **kwargs: Any) -> None:
-        # live updates (no state wipe)
         if "threshold_db" in kwargs and kwargs["threshold_db"] is not None:
             self.th = float(kwargs["threshold_db"])
         if "ratio" in kwargs and kwargs["ratio"] is not None:
             self.ratio = max(1.0, float(kwargs["ratio"]))
         if "attack_ms" in kwargs and kwargs["attack_ms"] is not None:
             self.atk_ms = float(kwargs["attack_ms"])
-            self._sr = None  # force coeff recalc
+            self._sr = None
         if "release_ms" in kwargs and kwargs["release_ms"] is not None:
             self.rel_ms = float(kwargs["release_ms"])
             self._sr = None
@@ -577,11 +597,12 @@ class Compressor(AudioFilter):
         if "stereo_link" in kwargs and kwargs["stereo_link"] is not None:
             self.stereo_link = bool(kwargs["stereo_link"])
 
-    def _ensure(self, C: int, sr: int):
+    def _ensure(self, C: int, sr: int) -> None:
         if self._sr != sr:
             self._sr = sr
             self._atk_a = self._alpha(self.atk_ms, sr)
             self._rel_a = self._alpha(self.rel_ms, sr)
+            # GR smoothing slightly different to keep UI changes stable
             self._g_atk_a = self._alpha(max(1.0, 0.6 * self.atk_ms), sr)
             self._g_rel_a = self._alpha(self.rel_ms * 1.1, sr)
 
@@ -589,32 +610,6 @@ class Compressor(AudioFilter):
             self._env = np.zeros((C,), dtype=np.float32)
         if self._gr_db is None or self._gr_db.shape[0] != C:
             self._gr_db = np.zeros((C,), dtype=np.float32)
-
-    def _soft_knee_gr_db(self, level_db: np.ndarray) -> np.ndarray:
-        T = float(self.th)
-        R = float(self.ratio)
-        K = float(max(0.0, self.knee_db))
-        over = level_db - T
-
-        if K <= 1e-6:
-            gr = np.where(over > 0.0, -(1.0 - 1.0 / R) * over, 0.0)
-            return gr.astype(np.float32)
-
-        halfK = 0.5 * K
-        knee_start = T - halfK
-        knee_end = T + halfK
-
-        below = level_db <= knee_start
-        above = level_db >= knee_end
-        inside = ~(below | above)
-
-        gr = np.zeros_like(level_db, dtype=np.float32)
-        gr[below] = 0.0
-        gr[above] = (-(1.0 - 1.0 / R) * over[above]).astype(np.float32)
-
-        knee_pos = (level_db[inside] - knee_start)
-        gr[inside] = (-(1.0 - 1.0 / R) * (knee_pos ** 2) / (2.0 * K)).astype(np.float32)
-        return gr
 
     def process(self, block: np.ndarray, sr: int) -> np.ndarray:
         x = block.astype(np.float32, copy=False)
@@ -628,37 +623,61 @@ class Compressor(AudioFilter):
         if env is None or gr_db is None:
             return x
 
-        atk, rel = self._atk_a, self._rel_a
-        gatk, grel = self._g_atk_a, self._g_rel_a
+        atk = float(self._atk_a)
+        rel = float(self._rel_a)
+        gatk = float(self._g_atk_a)
+        grel = float(self._g_rel_a)
+
+        T = float(self.th)
+        R = float(self.ratio)
+        K = float(max(0.0, self.knee_db))
         mk = float(self._mk_lin)
 
         out = np.empty_like(x, dtype=np.float32)
 
+        # tiny threshold to squash “tiny denormal-ish” values
+        tiny = 1e-20
+
         for i in range(n):
-            s = x[i]
-            abs_s = np.abs(s)
-
-            faster = abs_s > env
-            a = np.where(faster, atk, rel).astype(np.float32)
-            env = a * env + (1.0 - a) * abs_s
-
-            level_db = (20.0 * np.log10(np.maximum(env, _DEF_EPS))).astype(np.float32)
-            inst_gr = self._soft_knee_gr_db(level_db)
+            # envelope follower (per channel)
+            row = x[i]
+            for ch in range(C):
+                a = atk if abs(float(row[ch])) > float(env[ch]) else rel
+                env_ch = a * float(env[ch]) + (1.0 - a) * abs(float(row[ch]))
+                env[ch] = 0.0 if env_ch < tiny else env_ch
 
             if self.stereo_link and C > 1:
-                link_gr = float(np.min(inst_gr))
-                inst_gr[:] = link_gr
+                # compute linked GR target (most negative / strongest reduction)
+                link_gr = 0.0
+                first = True
+                for ch in range(C):
+                    lvl = 20.0 * math.log10(max(float(env[ch]), _DEF_EPS))
+                    g = self._soft_knee_gr_db_scalar(lvl, T, R, K)
+                    if first or g < link_gr:
+                        link_gr = g
+                        first = False
 
-            go_more = inst_gr < gr_db
-            ag = np.where(go_more, gatk, grel).astype(np.float32)
-            gr_db = ag * gr_db + (1.0 - ag) * inst_gr
+                inst = float(link_gr)
+                for ch in range(C):
+                    a = gatk if inst < float(gr_db[ch]) else grel
+                    gr = a * float(gr_db[ch]) + (1.0 - a) * inst
+                    gr_db[ch] = gr
 
-            gain_lin = (10.0 ** (gr_db / 20.0)).astype(np.float32) * mk
-            out[i] = s * gain_lin
+                    gain = mk * math.pow(10.0, gr / 20.0)
+                    out[i, ch] = float(row[ch]) * float(gain)
+            else:
+                for ch in range(C):
+                    lvl = 20.0 * math.log10(max(float(env[ch]), _DEF_EPS))
+                    inst = self._soft_knee_gr_db_scalar(lvl, T, R, K)
 
-        self._env = env
-        self._gr_db = gr_db
+                    a = gatk if inst < float(gr_db[ch]) else grel
+                    gr = a * float(gr_db[ch]) + (1.0 - a) * float(inst)
+                    gr_db[ch] = gr
 
+                    gain = mk * math.pow(10.0, gr / 20.0)
+                    out[i, ch] = float(row[ch]) * float(gain)
+
+        # safety + clip
         if not np.all(np.isfinite(out)):
             out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 
@@ -675,13 +694,18 @@ class Compressor(AudioFilter):
     ],
 )
 class Limiter(AudioFilter):
+    """
+    Fast peak limiter:
+      - scalar envelope (shared across channels via peak)
+      - NO per-sample numpy ops/allocs
+    """
     def __init__(self, params: Union[Dict[str, Any], None] = None, **kwargs: Any):
         p = dict(params or {})
         p.update(kwargs)
         self.ceil_db = float(p.get("ceiling_db", -1.0))
         self.rel_ms = float(p.get("release_ms", 50.0))
 
-        self.env: Optional[np.ndarray] = None
+        self._env: float = 1.0
         self._rel_alpha: float = 0.0
         self._ceil_lin: float = _db_to_lin(self.ceil_db)
         self._sr: Optional[int] = None
@@ -694,16 +718,12 @@ class Limiter(AudioFilter):
             self.rel_ms = float(kwargs["release_ms"])
             self._sr = None
 
-    def _ensure(self, C: int, sr: int):
-        if self.env is None or self.env.shape[0] != C:
-            self.env = np.zeros((C,), dtype=np.float32)
-
+    def _ensure(self, sr: int) -> None:
         if self._sr != sr:
             self._sr = sr
             sr = int(max(1, sr))
-            # stable release coefficient
             tau = max(1e-4, float(self.rel_ms) * 1e-3)
-            self._rel_alpha = float(np.exp(-1.0 / (tau * sr)))
+            self._rel_alpha = float(math.exp(-1.0 / (tau * sr)))
 
     def process(self, block: np.ndarray, sr: int) -> np.ndarray:
         x = block.astype(np.float32, copy=False)
@@ -711,29 +731,35 @@ class Limiter(AudioFilter):
         if n == 0:
             return x
 
-        self._ensure(C, sr)
-        env = self.env
-        if env is None:
-            return x
-
+        self._ensure(sr)
         rel = float(self._rel_alpha)
         ceil_lin = float(self._ceil_lin)
 
         out = np.empty_like(x, dtype=np.float32)
+        env = float(self._env)
 
         for i in range(n):
             env *= rel
-            peak = float(np.max(np.abs(x[i])))
+
+            # peak across channels (no allocations)
+            row = x[i]
+            peak = 0.0
+            for ch in range(C):
+                v = abs(float(row[ch]))
+                if v > peak:
+                    peak = v
+
             needed = peak / max(ceil_lin, _DEF_EPS)
-            if needed > 1.0:
-                np.maximum(env, needed, out=env)
+            if needed > 1.0 and needed > env:
+                env = needed
 
-            gain = 1.0 / np.maximum(env, 1.0)
-            out[i] = x[i] * gain
+            gain = 1.0 / (env if env > 1.0 else 1.0)
+            for ch in range(C):
+                out[i, ch] = float(row[ch]) * float(gain)
 
+        self._env = env
         np.clip(out, -ceil_lin, ceil_lin, out=out)
         return out
-
 
 @register_filter(
     "mixdown",
@@ -1095,7 +1121,6 @@ class Master(AudioFilter):
         self.params: Dict[str, Any] = dict(params or {})
         self.params.update(kwargs)
 
-        self._initd = False
         self._sr: Optional[int] = None
         self._C: Optional[int] = None
 
@@ -1110,20 +1135,18 @@ class Master(AudioFilter):
         self._cl: Optional[Limiter] = None
 
         self._mk: SmoothGain = SmoothGain(1.0, ramp_ms=10.0)
+
         self._mix_buf: Optional[np.ndarray] = None
+        self._dirty: bool = True
+        self._applied: Dict[str, Any] = {}
 
     def set_params(self, **kwargs: Any) -> None:
-        # update stored params; force rebuild next process to avoid partial rewire pops
         for k, v in kwargs.items():
             self.params[k] = v
-        self._initd = False
+        self._dirty = True
 
-    def _ensure(self, sr: int, C: int):
-        if self._initd and self._sr == sr and self._C == C:
-            return
-
-        self._sr, self._C = sr, C
-
+    def _get_cfg(self) -> Dict[str, Any]:
+        # read + sanitize
         low_cut = float(self.params.get("low_cut", 30.0))
         x1 = float(self.params.get("x1", 200.0))
         x2 = float(self.params.get("x2", 4000.0))
@@ -1137,33 +1160,96 @@ class Master(AudioFilter):
         low_th = float(self.params.get("low_th", -24.0))
         mid_th = float(self.params.get("mid_th", -20.0))
         high_th = float(self.params.get("high_th", -22.0))
+
         low_ratio = float(self.params.get("low_ratio", 2.0))
         mid_ratio = float(self.params.get("mid_ratio", 2.5))
         high_ratio = float(self.params.get("high_ratio", 2.0))
 
+        # basic guards
+        low_cut = max(10.0, low_cut)
+        x1 = max(20.0, x1)
+        x2 = max(x1 + 20.0, x2)
+        order = int(max(1, min(8, order)))
+
+        return {
+            "low_cut": low_cut,
+            "x1": x1,
+            "x2": x2,
+            "order": order,
+            "atk": atk,
+            "rel": rel,
+            "makeup_db": makeup_db,
+            "ceiling_db": ceiling_db,
+            "low_th": low_th,
+            "mid_th": mid_th,
+            "high_th": high_th,
+            "low_ratio": low_ratio,
+            "mid_ratio": mid_ratio,
+            "high_ratio": high_ratio,
+        }
+
+    def _ensure(self, sr: int, C: int) -> None:
+        # build once
+        if self._hpf is None:
+            self._hpf = Highpass({"cutoff": 30.0, "order": 2})
+            self._lp = Lowpass({"cutoff": 200.0, "order": 2})
+            self._bp = Bandpass({"low": 200.0, "high": 4000.0, "order": 2})
+            self._hp = Highpass({"cutoff": 4000.0, "order": 2})
+
+            shared = {"attack_ms": 5.0, "release_ms": 60.0, "makeup_db": 0.0, "knee_db": 6.0, "stereo_link": True}
+            self._cL = Compressor({"threshold_db": -24.0, "ratio": 2.0, **shared})
+            self._cM = Compressor({"threshold_db": -20.0, "ratio": 2.5, **shared})
+            self._cH = Compressor({"threshold_db": -22.0, "ratio": 2.0, **shared})
+            self._cl = Limiter({"ceiling_db": -1.0, "release_ms": 80.0})
+
+            self._dirty = True
+            self._applied = {}
+
+        self._sr, self._C = sr, C
+
+        if not self._dirty:
+            return
+
+        cfg = self._get_cfg()
+
+        # Only push changes when they actually changed (prevents constant redesign)
+        def changed(k: str) -> bool:
+            return self._applied.get(k) != cfg[k]
+
         # filters
-        self._hpf = Highpass({"cutoff": max(10.0, low_cut), "order": 2})
-        self._lp = Lowpass({"cutoff": x1, "order": order})
-        self._bp = Bandpass({"low": x1, "high": x2, "order": order})
-        self._hp = Highpass({"cutoff": x2, "order": order})
+        if changed("low_cut"):
+            self._hpf.set_params(cutoff=cfg["low_cut"])
+        if changed("x1") or changed("order"):
+            self._lp.set_params(cutoff=cfg["x1"], order=cfg["order"])
+        if changed("x1") or changed("x2") or changed("order"):
+            self._bp.set_params(low=cfg["x1"], high=cfg["x2"], order=cfg["order"])
+        if changed("x2") or changed("order"):
+            self._hp.set_params(cutoff=cfg["x2"], order=cfg["order"])
 
-        shared = {"attack_ms": atk, "release_ms": rel, "makeup_db": 0.0, "knee_db": 6.0, "stereo_link": True}
-        self._cL = Compressor({"threshold_db": low_th, "ratio": low_ratio, **shared})
-        self._cM = Compressor({"threshold_db": mid_th, "ratio": mid_ratio, **shared})
-        self._cH = Compressor({"threshold_db": high_th, "ratio": high_ratio, **shared})
-        self._cl = Limiter({"ceiling_db": ceiling_db, "release_ms": 80.0})
+        # compressors (don’t reset state; just update params)
+        shared_comp = {"attack_ms": cfg["atk"], "release_ms": cfg["rel"], "makeup_db": 0.0, "knee_db": 6.0, "stereo_link": True}
+        if changed("low_th") or changed("low_ratio") or changed("atk") or changed("rel"):
+            self._cL.set_params(threshold_db=cfg["low_th"], ratio=cfg["low_ratio"], **shared_comp)
+        if changed("mid_th") or changed("mid_ratio") or changed("atk") or changed("rel"):
+            self._cM.set_params(threshold_db=cfg["mid_th"], ratio=cfg["mid_ratio"], **shared_comp)
+        if changed("high_th") or changed("high_ratio") or changed("atk") or changed("rel"):
+            self._cH.set_params(threshold_db=cfg["high_th"], ratio=cfg["high_ratio"], **shared_comp)
 
-        self._mk.set_params(db=makeup_db)
+        # limiter + makeup
+        if changed("ceiling_db"):
+            self._cl.set_params(ceiling_db=cfg["ceiling_db"])
+        if changed("makeup_db"):
+            self._mk.set_params(db=cfg["makeup_db"])
 
-        self._mix_buf = None
-        self._initd = True
+        self._applied = cfg
+        self._dirty = False
 
     def process(self, block: np.ndarray, sr: int) -> np.ndarray:
         x = block.astype(np.float32, copy=False)
-        if x.shape[0] == 0:
+        n, C = x.shape
+        if n == 0:
             return x
 
-        n, C = x.shape
         self._ensure(sr, C)
 
         if self._mix_buf is None or self._mix_buf.shape != (n, C):
@@ -1183,10 +1269,9 @@ class Master(AudioFilter):
         np.add(low, mid, out=self._mix_buf)
         self._mix_buf += high
 
-        # smooth makeup
         mk_applied = self._mk.process(self._mix_buf, sr)
         out = self._cl.process(mk_applied, sr)
 
-        # tiny soft-clip to kill edge crackles when users slam params
         out = _soft_clip(out)
-        return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
+        np.clip(out, -1.0, 1.0, out=out)
+        return out.astype(np.float32, copy=False)
