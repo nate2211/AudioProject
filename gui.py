@@ -21,6 +21,7 @@ from pydub import AudioSegment
 import time
 import warps
 import clarity
+import vocals
 from helpers import FixedBlockAdapter, DCBlocker, SoftClipper, Limiter
 from filters import available_filters, build_filter  # FX rack; SYNC/WSOLA is self-contained
 

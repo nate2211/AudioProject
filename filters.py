@@ -1,16 +1,34 @@
 # =============================
-# filters.py (REWRITE)
-# Stream-safe audio filter registry + GUI-friendly param specs + anti-crackle safeguards
+# filters.py
+# Native-backed stream-safe audio filter registry
 # =============================
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 from scipy import signal
+
+
+try:
+    from native import (
+        is_available as _native_is_available,
+        NativeSOS as _NativeSOS,
+        NativeCompressor as _NativeCompressor,
+        NativeLimiter as _NativeLimiter,
+        NativeSoftClipper as _NativeSoftClipper,
+    )
+
+    _NATIVE_OK = bool(_native_is_available())
+except Exception:
+    _NATIVE_OK = False
+    _NativeSOS = None
+    _NativeCompressor = None
+    _NativeLimiter = None
+    _NativeSoftClipper = None
+
 
 # =============================================================================
 # Param specs for GUI auto-generation
@@ -18,14 +36,6 @@ from scipy import signal
 
 @dataclass(frozen=True)
 class ParamSpec:
-    """
-    GUI-friendly parameter metadata.
-
-    kind:
-      - "float" | "int" | "bool" | "enum"
-    scale:
-      - "linear" | "log" | "db"
-    """
     name: str
     kind: str = "float"
     default: Any = 0.0
@@ -40,7 +50,7 @@ class ParamSpec:
 @dataclass
 class FilterInfo:
     help: str
-    factory: Any  # class or callable
+    factory: Any
     params: List[ParamSpec]
 
 
@@ -75,14 +85,7 @@ def filter_param_specs(name: str) -> List[ParamSpec]:
 
 
 class AudioFilter:
-    """
-    Base class for streamable audio filters.
-      process(block, sr) -> (N,C) float32 [-1,1]
-      flush() -> optional tail (T,C) float32
-      set_params(**kwargs) -> update live params (no reset pops where possible)
-    """
     def set_params(self, **kwargs: Any) -> None:
-        # Default: no-op (GUI can rebuild + crossfade if needed)
         return
 
     def process(self, block: np.ndarray, sr: int) -> np.ndarray:
@@ -93,29 +96,54 @@ class AudioFilter:
 
 
 # =============================================================================
-# Utilities (anti-NaN, anti-pop, stable biquads)
+# Utilities
 # =============================================================================
 
 _DEF_EPS = 1e-12
+_F32 = np.float32
+
+
+def _ensure_2d(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim == 1:
+        x = x[:, None]
+    if x.ndim != 2:
+        raise ValueError(f"Expected audio array shaped (frames, channels), got {x.shape!r}")
+    return np.ascontiguousarray(x, dtype=np.float32)
+
 
 def _db_to_lin(db: float) -> float:
     return float(10 ** (float(db) / 20.0))
 
+
+def _lin_to_db(x: float) -> float:
+    return float(20.0 * math.log10(max(float(x), _DEF_EPS)))
+
+
 def _clamp(v: float, lo: float, hi: float) -> float:
     return float(min(max(float(v), float(lo)), float(hi)))
 
+
+def _safe_audio(x: np.ndarray, ceiling: float = 1.0) -> np.ndarray:
+    y = np.asarray(x, dtype=np.float32)
+    if not np.isfinite(y).all():
+        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return np.clip(y, -float(ceiling), float(ceiling)).astype(np.float32, copy=False)
+
+
 def _safe_norm_freq(sr: int, f0: float) -> float:
-    # clamp f0 to (0, Nyquist)
     f0 = float(max(1e-3, min(float(f0), 0.5 * sr * 0.999)))
     return 2.0 * math.pi * (f0 / sr)
 
+
 def _biquad_to_sos(b0: float, b1: float, b2: float, a0: float, a1: float, a2: float) -> np.ndarray:
-    # normalize a0 to 1
-    if a0 == 0.0:
+    if abs(a0) < 1e-12:
         a0 = 1e-12
-    b0n, b1n, b2n = b0 / a0, b1 / a0, b2 / a0
-    a1n, a2n = a1 / a0, a2 / a0
-    return np.array([[b0n, b1n, b2n, 1.0, a1n, a2n]], dtype=np.float64)
+    return np.array(
+        [[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]],
+        dtype=np.float64,
+    )
+
 
 def _iir_peaking_sos(sr: int, f0: float, Q: float, gain_db: float) -> np.ndarray:
     Q = float(max(1e-6, Q))
@@ -133,42 +161,60 @@ def _iir_peaking_sos(sr: int, f0: float, Q: float, gain_db: float) -> np.ndarray
     a2 = 1.0 - alpha / A
     return _biquad_to_sos(b0, b1, b2, a0, a1, a2)
 
-def _iir_shelf_sos(sr: int, f0: float, gain_db: float, *, shelf_type: str = "low", slope: float = 1.0) -> np.ndarray:
-    # RBJ shelf with guard against sqrt domain errors
+
+def _iir_shelf_sos(
+    sr: int,
+    f0: float,
+    gain_db: float,
+    *,
+    shelf_type: str = "low",
+    slope: float = 1.0,
+) -> np.ndarray:
     S = float(max(1e-6, slope))
     A = 10.0 ** (float(gain_db) / 40.0)
     w0 = _safe_norm_freq(sr, f0)
     cw = math.cos(w0)
     sw = math.sin(w0)
 
-    # sqrt argument can go slightly negative due to numeric or S>1 usage; clamp to >=0
     sqrt_arg = (A + 1.0 / A) * (1.0 / S - 1.0) + 2.0
     sqrt_arg = max(0.0, float(sqrt_arg))
     alpha = sw / 2.0 * math.sqrt(sqrt_arg)
 
     st = shelf_type.lower()
+
     if st in ("low", "lowshelf", "ls"):
-        b0 =    A * ((A + 1) - (A - 1) * cw + 2.0 * math.sqrt(A) * alpha)
-        b1 =  2*A * ((A - 1) - (A + 1) * cw)
-        b2 =    A * ((A + 1) - (A - 1) * cw - 2.0 * math.sqrt(A) * alpha)
-        a0 =        (A + 1) + (A - 1) * cw + 2.0 * math.sqrt(A) * alpha
-        a1 =   -2 * ((A - 1) + (A + 1) * cw)
-        a2 =        (A + 1) + (A - 1) * cw - 2.0 * math.sqrt(A) * alpha
+        b0 = A * ((A + 1) - (A - 1) * cw + 2.0 * math.sqrt(A) * alpha)
+        b1 = 2 * A * ((A - 1) - (A + 1) * cw)
+        b2 = A * ((A + 1) - (A - 1) * cw - 2.0 * math.sqrt(A) * alpha)
+        a0 = (A + 1) + (A - 1) * cw + 2.0 * math.sqrt(A) * alpha
+        a1 = -2 * ((A - 1) + (A + 1) * cw)
+        a2 = (A + 1) + (A - 1) * cw - 2.0 * math.sqrt(A) * alpha
+
     elif st in ("high", "highshelf", "hs"):
-        b0 =    A * ((A + 1) + (A - 1) * cw + 2.0 * math.sqrt(A) * alpha)
-        b1 = -2*A * ((A - 1) + (A + 1) * cw)
-        b2 =    A * ((A + 1) + (A - 1) * cw - 2.0 * math.sqrt(A) * alpha)
-        a0 =        (A + 1) - (A - 1) * cw + 2.0 * math.sqrt(A) * alpha
-        a1 =    2 * ((A - 1) - (A + 1) * cw)
-        a2 =        (A + 1) - (A - 1) * cw - 2.0 * math.sqrt(A) * alpha
+        b0 = A * ((A + 1) + (A - 1) * cw + 2.0 * math.sqrt(A) * alpha)
+        b1 = -2 * A * ((A - 1) + (A + 1) * cw)
+        b2 = A * ((A + 1) + (A - 1) * cw - 2.0 * math.sqrt(A) * alpha)
+        a0 = (A + 1) - (A - 1) * cw + 2.0 * math.sqrt(A) * alpha
+        a1 = 2 * ((A - 1) - (A + 1) * cw)
+        a2 = (A + 1) - (A - 1) * cw - 2.0 * math.sqrt(A) * alpha
+
     else:
-        raise ValueError(f"Unknown shelf_type '{shelf_type}' (use 'low' or 'high').")
+        raise ValueError(f"Unknown shelf_type '{shelf_type}'")
 
     return _biquad_to_sos(b0, b1, b2, a0, a1, a2)
 
+
 def _soft_clip(x: np.ndarray) -> np.ndarray:
-    # very light safety; keep it predictable
+    x = _ensure_2d(x)
+
+    if _NATIVE_OK and _NativeSoftClipper is not None:
+        try:
+            return _NativeSoftClipper(drive=1.0).process(x, 48000)
+        except Exception:
+            pass
+
     return np.tanh(x).astype(np.float32, copy=False)
+
 
 def _ramp(start: float, end: float, n: int) -> np.ndarray:
     if n <= 1:
@@ -177,7 +223,7 @@ def _ramp(start: float, end: float, n: int) -> np.ndarray:
 
 
 # =============================================================================
-# Builder (works with classes expecting dict OR kwargs)
+# Builder
 # =============================================================================
 
 def build_filter(name: str, **kwargs: Any) -> AudioFilter:
@@ -188,14 +234,12 @@ def build_filter(name: str, **kwargs: Any) -> AudioFilter:
     info = _REGISTRY[key]
     factory = info.factory
 
-    # 1) If it's a class (subclass AudioFilter), support either __init__(params_dict) or __init__(**kwargs)
     if isinstance(factory, type):
         try:
-            return factory(**kwargs)  # type: ignore
+            return factory(**kwargs)
         except TypeError:
-            return factory(kwargs)    # type: ignore
+            return factory(kwargs)
 
-    # 2) If it's callable factory
     try:
         return factory(**kwargs)
     except TypeError:
@@ -203,13 +247,10 @@ def build_filter(name: str, **kwargs: Any) -> AudioFilter:
 
 
 # =============================================================================
-# A) Crackle prevention: smooth gain changes + stable IIR init
+# Smooth gain
 # =============================================================================
 
 class SmoothGain(AudioFilter):
-    """
-    Gain wrapper: ramps gain changes over ~5ms to avoid clicks when GUI updates.
-    """
     def __init__(self, g_lin: float, ramp_ms: float = 5.0):
         self._g = float(g_lin)
         self._target = float(g_lin)
@@ -222,44 +263,43 @@ class SmoothGain(AudioFilter):
             self._target = _db_to_lin(float(kwargs["db"]))
 
     def process(self, block: np.ndarray, sr: int) -> np.ndarray:
-        x = block.astype(np.float32, copy=False)
+        x = _ensure_2d(block)
         n = x.shape[0]
+
         if n == 0:
             return x
 
         if self._target == self._g:
-            y = x * self._g
-            return np.clip(y, -1.0, 1.0).astype(np.float32, copy=False)
+            return _safe_audio(x * self._g)
 
         ramp_n = int(max(1, (self._ramp_ms * 1e-3) * sr))
         ramp_n = min(ramp_n, n)
+
         g0 = float(self._g)
         g1 = float(self._target)
 
-        gvec = _ramp(g0, g1, ramp_n)
         y = x.copy()
-        y[:ramp_n] *= gvec[:, None]
+        y[:ramp_n] *= _ramp(g0, g1, ramp_n)[:, None]
+
         if ramp_n < n:
             y[ramp_n:] *= g1
 
         self._g = g1
-        return np.clip(y, -1.0, 1.0).astype(np.float32, copy=False)
+        return _safe_audio(y)
 
+
+# =============================================================================
+# Native-backed SOS base
+# =============================================================================
 
 class _IIRSOS(AudioFilter):
-    """
-    SOS IIR with:
-      - stable wn clamping
-      - zi initialization using sosfilt_zi * x0 to avoid first-block pop
-      - no NaNs / infs
-    """
     def __init__(self):
         self.sos: Optional[np.ndarray] = None
-        self.zi: Optional[np.ndarray] = None  # (S, C, 2)
+        self.zi: Optional[np.ndarray] = None
         self._initd = False
         self._sr: Optional[int] = None
         self._C: Optional[int] = None
-        self._primed = False
+        self._native = None
 
     def _design(self, sr: int) -> np.ndarray:
         raise NotImplementedError
@@ -267,57 +307,72 @@ class _IIRSOS(AudioFilter):
     def _ensure(self, sr: int, C: int, x0: Optional[np.ndarray] = None):
         if self._initd and self._sr == sr and self._C == C:
             return
+
         sos = self._design(sr).astype(np.float64, copy=False)
+
         if sos.ndim != 2 or sos.shape[1] != 6:
             raise ValueError("IIR design must return SOS with shape (S,6).")
-        self.sos = sos.astype(np.float32, copy=False)
-        S = self.sos.shape[0]
 
-        # zi prime: sosfilt_zi gives (S,2) for one channel
+        self.sos = np.ascontiguousarray(sos.astype(np.float32), dtype=np.float32)
+        self._sr = sr
+        self._C = C
+        self._initd = True
+        self.zi = None
+        self._native = None
+
+        if _NATIVE_OK and _NativeSOS is not None:
+            try:
+                self._native = _NativeSOS(self.sos, channels=C, reset_state=True)
+                return
+            except Exception:
+                self._native = None
+
         zi0 = signal.sosfilt_zi(self.sos.astype(np.float64))
-        zi = np.zeros((S, C, 2), dtype=np.float32)
+        zi = np.zeros((self.sos.shape[0], C, 2), dtype=np.float32)
+
         if x0 is not None and x0.size == C:
-            # zi per channel scaled by first sample value
             for ch in range(C):
                 zi[:, ch, :] = (zi0 * float(x0[ch])).astype(np.float32)
-            self._primed = True
-        else:
-            self._primed = False
 
         self.zi = zi
-        self._sr, self._C, self._initd = sr, C, True
 
     def process(self, block: np.ndarray, sr: int) -> np.ndarray:
-        x = block.astype(np.float32, copy=False)
+        x = _ensure_2d(block)
         n, C = x.shape
+
         if n == 0:
             return x
 
-        # prime on first use with first-sample to avoid pop
-        if not self._initd:
-            self._ensure(sr, C, x0=x[0])
-        else:
-            self._ensure(sr, C, x0=None)
+        self._ensure(sr, C, x0=x[0] if not self._initd else None)
 
-        sos = self.sos
-        zi = self.zi
-        if sos is None or zi is None:
+        if self.sos is None:
             return x
 
+        if self._native is not None:
+            try:
+                return _safe_audio(self._native.process(x, sr))
+            except Exception:
+                self._native = None
+                self.zi = None
+
+        if self.zi is None or self.zi.shape[1] != C or self.zi.shape[0] != self.sos.shape[0]:
+            zi0 = signal.sosfilt_zi(self.sos.astype(np.float64))
+            self.zi = np.tile(zi0[:, None, :], (1, C, 1)).astype(np.float32)
+
         y = np.empty_like(x, dtype=np.float32)
+
         for ch in range(C):
-            y[:, ch], zi[:, ch, :] = signal.sosfilt(sos, x[:, ch], zi=zi[:, ch, :])
+            y[:, ch], self.zi[:, ch, :] = signal.sosfilt(
+                self.sos.astype(np.float64),
+                x[:, ch],
+                zi=self.zi[:, ch, :],
+            )
 
-        self.zi = zi
-
-        # safety
-        if not np.all(np.isfinite(y)):
-            y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-        return y
+        return _safe_audio(y)
 
 
 # =============================================================================
-# Filters (all params declared for GUI auto-gen)
+# Filters
 # =============================================================================
 
 @register_filter(
@@ -335,11 +390,10 @@ class Gain(AudioFilter):
         p.update(kwargs)
 
         ramp_ms = float(p.get("ramp_ms", 5.0))
-
         lin = p.get("lin", None)
+
         if lin is None:
-            db = float(p.get("db", 0.0))
-            lin = _db_to_lin(db)
+            lin = _db_to_lin(float(p.get("db", 0.0)))
 
         self._g = SmoothGain(float(lin), ramp_ms=ramp_ms)
 
@@ -359,11 +413,6 @@ class Gain(AudioFilter):
     ],
 )
 class Normalize(AudioFilter):
-    """
-    Streaming-friendly normalize:
-      - tracks running max
-      - ramps gain changes so it doesn't "tick" when max updates
-    """
     def __init__(self, params: Union[Dict[str, Any], None] = None, **kwargs: Any):
         p = dict(params or {})
         p.update(kwargs)
@@ -377,22 +426,20 @@ class Normalize(AudioFilter):
             self.target = float(kwargs["peak"])
         if "ramp_ms" in kwargs and kwargs["ramp_ms"] is not None:
             self.ramp_ms = float(kwargs["ramp_ms"])
-            # keep current gain, just change ramp time
-            self._g._ramp_ms = self.ramp_ms  # intentional internal tweak
+            self._g._ramp_ms = self.ramp_ms
 
     def process(self, block: np.ndarray, sr: int) -> np.ndarray:
-        x = block.astype(np.float32, copy=False)
+        x = _ensure_2d(block)
         m = float(np.max(np.abs(x))) if x.size else 0.0
+
         if m > self._max:
             self._max = m
 
         if self._max < _DEF_EPS:
             return x
 
-        desired = float(self.target / self._max)
-        self._g.set_params(lin=desired)
-        y = self._g.process(x, sr)
-        return np.clip(y, -1.0, 1.0).astype(np.float32, copy=False)
+        self._g.set_params(lin=float(self.target / self._max))
+        return _safe_audio(self._g.process(x, sr))
 
 
 @register_filter(
@@ -422,8 +469,7 @@ class Lowpass(_IIRSOS):
     def _design(self, sr: int) -> np.ndarray:
         nyq = 0.5 * sr
         wn = _clamp(self.cutoff / nyq, 1e-5, 0.9999)
-        order = int(max(1, min(12, self.order)))
-        return signal.butter(order, wn, btype="low", output="sos")
+        return signal.butter(int(max(1, min(12, self.order))), wn, btype="low", output="sos")
 
 
 @register_filter(
@@ -453,8 +499,7 @@ class Highpass(_IIRSOS):
     def _design(self, sr: int) -> np.ndarray:
         nyq = 0.5 * sr
         wn = _clamp(self.cutoff / nyq, 1e-5, 0.9999)
-        order = int(max(1, min(12, self.order)))
-        return signal.butter(order, wn, btype="high", output="sos")
+        return signal.butter(int(max(1, min(12, self.order))), wn, btype="high", output="sos")
 
 
 @register_filter(
@@ -478,37 +523,32 @@ class Bandpass(_IIRSOS):
     def set_params(self, **kwargs: Any) -> None:
         changed = False
         if "low" in kwargs and kwargs["low"] is not None:
-            self.low = float(kwargs["low"]); changed = True
+            self.low = float(kwargs["low"])
+            changed = True
         if "high" in kwargs and kwargs["high"] is not None:
-            self.high = float(kwargs["high"]); changed = True
+            self.high = float(kwargs["high"])
+            changed = True
         if "order" in kwargs and kwargs["order"] is not None:
-            self.order = int(kwargs["order"]); changed = True
+            self.order = int(kwargs["order"])
+            changed = True
         if changed:
             self._initd = False
 
     def _design(self, sr: int) -> np.ndarray:
         nyq = 0.5 * sr
-        lo = float(self.low)
-        hi = float(self.high)
-
-        # enforce ordering + minimum bandwidth
-        lo = max(10.0, lo)
-        hi = max(lo + 10.0, hi)
-
+        lo = max(10.0, float(self.low))
+        hi = max(lo + 10.0, float(self.high))
         lo_n = _clamp(lo / nyq, 1e-5, 0.9998)
         hi_n = _clamp(hi / nyq, lo_n + 1e-5, 0.9999)
-
-        order = int(max(1, min(12, self.order)))
-        return signal.butter(order, [lo_n, hi_n], btype="band", output="sos")
+        return signal.butter(int(max(1, min(12, self.order))), [lo_n, hi_n], btype="band", output="sos")
 
 
 @register_filter(
     "compress",
-    help=("Smooth compressor. Params: threshold_db(-24) ratio(4) attack_ms(5) release_ms(50) "
-          "makeup_db(0) knee_db(6) stereo_link(true)"),
+    help="Smooth compressor. Params: threshold_db(-24) ratio(4) attack_ms(5) release_ms(50) makeup_db(0) knee_db(6) stereo_link(true)",
     params=[
         ParamSpec("threshold_db", kind="float", default=-24.0, minimum=-60.0, maximum=0.0, step=0.5, scale="db", unit="dB"),
-        ParamSpec("ratio", kind="float", default=4.0, minimum=1.0, maximum=20.0, step=0.1, scale="linear"),
+        ParamSpec("ratio", kind="float", default=4.0, minimum=1.0, maximum=20.0, step=0.1),
         ParamSpec("attack_ms", kind="float", default=5.0, minimum=0.1, maximum=200.0, step=0.1, unit="ms"),
         ParamSpec("release_ms", kind="float", default=50.0, minimum=1.0, maximum=2000.0, step=1.0, unit="ms"),
         ParamSpec("makeup_db", kind="float", default=0.0, minimum=-12.0, maximum=24.0, step=0.5, scale="db", unit="dB"),
@@ -517,13 +557,6 @@ class Bandpass(_IIRSOS):
     ],
 )
 class Compressor(AudioFilter):
-    """
-    Stream-safe compressor (fast path):
-      - NO per-sample numpy allocations
-      - envelope + GR smoothing kept
-      - optional stereo link
-      - guards against NaN/inf + denorm-ish tiny values
-    """
     def __init__(self, params: Union[Dict[str, Any], None] = None, **kwargs: Any):
         p = dict(params or {})
         p.update(kwargs)
@@ -536,179 +569,137 @@ class Compressor(AudioFilter):
         self.knee_db = float(p.get("knee_db", 6.0))
 
         sl = p.get("stereo_link", True)
-        if isinstance(sl, str):
-            self.stereo_link = sl.strip().lower() in ("1", "true", "yes", "on")
-        else:
-            self.stereo_link = bool(sl)
+        self.stereo_link = sl.strip().lower() in ("1", "true", "yes", "on") if isinstance(sl, str) else bool(sl)
 
-        self._env: Optional[np.ndarray] = None     # (C,)
-        self._gr_db: Optional[np.ndarray] = None   # (C,)
-        self._sr: Optional[int] = None
+        self._env: Optional[np.ndarray] = None
+        self._native = None
+        self._make_native()
 
-        self._atk_a: float = 0.0
-        self._rel_a: float = 0.0
-        self._g_atk_a: float = 0.0
-        self._g_rel_a: float = 0.0
-        self._mk_lin: float = _db_to_lin(self.mk_db)
-
-    @staticmethod
-    def _alpha(ms: float, sr: int) -> float:
-        sr = int(max(1, sr))
-        ms = float(max(0.1, ms))
-        return float(math.exp(-1.0 / (ms * 1e-3 * sr)))
-
-    @staticmethod
-    def _soft_knee_gr_db_scalar(level_db: float, T: float, R: float, K: float) -> float:
-        # returns negative dB gain-reduction (0 = no GR)
-        over = level_db - T
-        if K <= 1e-6:
-            if over > 0.0:
-                return -(1.0 - 1.0 / R) * over
-            return 0.0
-
-        halfK = 0.5 * K
-        knee_start = T - halfK
-        knee_end = T + halfK
-
-        if level_db <= knee_start:
-            return 0.0
-        if level_db >= knee_end:
-            return -(1.0 - 1.0 / R) * over
-
-        knee_pos = level_db - knee_start
-        return -(1.0 - 1.0 / R) * (knee_pos * knee_pos) / (2.0 * K)
+    def _make_native(self):
+        self._native = None
+        if _NATIVE_OK and _NativeCompressor is not None and self.stereo_link:
+            try:
+                self._native = _NativeCompressor(
+                    threshold_db=self.th,
+                    ratio=self.ratio,
+                    knee_db=self.knee_db,
+                    attack_ms=self.atk_ms,
+                    release_ms=self.rel_ms,
+                    makeup_db=self.mk_db,
+                    mix=1.0,
+                )
+            except Exception:
+                self._native = None
 
     def set_params(self, **kwargs: Any) -> None:
+        rebuild = False
+
         if "threshold_db" in kwargs and kwargs["threshold_db"] is not None:
             self.th = float(kwargs["threshold_db"])
         if "ratio" in kwargs and kwargs["ratio"] is not None:
             self.ratio = max(1.0, float(kwargs["ratio"]))
         if "attack_ms" in kwargs and kwargs["attack_ms"] is not None:
             self.atk_ms = float(kwargs["attack_ms"])
-            self._sr = None
         if "release_ms" in kwargs and kwargs["release_ms"] is not None:
             self.rel_ms = float(kwargs["release_ms"])
-            self._sr = None
         if "makeup_db" in kwargs and kwargs["makeup_db"] is not None:
             self.mk_db = float(kwargs["makeup_db"])
-            self._mk_lin = _db_to_lin(self.mk_db)
         if "knee_db" in kwargs and kwargs["knee_db"] is not None:
             self.knee_db = float(kwargs["knee_db"])
         if "stereo_link" in kwargs and kwargs["stereo_link"] is not None:
             self.stereo_link = bool(kwargs["stereo_link"])
+            rebuild = True
 
-    def _ensure(self, C: int, sr: int) -> None:
-        if self._sr != sr:
-            self._sr = sr
-            self._atk_a = self._alpha(self.atk_ms, sr)
-            self._rel_a = self._alpha(self.rel_ms, sr)
-            # GR smoothing slightly different to keep UI changes stable
-            self._g_atk_a = self._alpha(max(1.0, 0.6 * self.atk_ms), sr)
-            self._g_rel_a = self._alpha(self.rel_ms * 1.1, sr)
+        if self._native is not None:
+            try:
+                self._native.set_params(
+                    threshold_db=self.th,
+                    ratio=self.ratio,
+                    knee_db=self.knee_db,
+                    attack_ms=self.atk_ms,
+                    release_ms=self.rel_ms,
+                    makeup_db=self.mk_db,
+                    mix=1.0,
+                )
+            except Exception:
+                rebuild = True
 
+        if rebuild:
+            self._make_native()
+
+    def _fallback_process(self, x: np.ndarray, sr: int) -> np.ndarray:
+        n, C = x.shape
         if self._env is None or self._env.shape[0] != C:
             self._env = np.zeros((C,), dtype=np.float32)
-        if self._gr_db is None or self._gr_db.shape[0] != C:
-            self._gr_db = np.zeros((C,), dtype=np.float32)
 
-    def process(self, block: np.ndarray, sr: int) -> np.ndarray:
-        x = block.astype(np.float32, copy=False)
-        n, C = x.shape
-        if n == 0:
-            return x
-
-        self._ensure(C, sr)
-        env = self._env
-        gr_db = self._gr_db
-        if env is None or gr_db is None:
-            return x
-
-        atk = float(self._atk_a)
-        rel = float(self._rel_a)
-        gatk = float(self._g_atk_a)
-        grel = float(self._g_rel_a)
-
-        T = float(self.th)
-        R = float(self.ratio)
-        K = float(max(0.0, self.knee_db))
-        mk = float(self._mk_lin)
-
-        out = np.empty_like(x, dtype=np.float32)
-
-        # tiny threshold to squash “tiny denormal-ish” values
-        tiny = 1e-20
+        atk = math.exp(-1.0 / (max(0.1, self.atk_ms) * 1e-3 * max(1, sr)))
+        rel = math.exp(-1.0 / (max(0.1, self.rel_ms) * 1e-3 * max(1, sr)))
+        mk = _db_to_lin(self.mk_db)
+        out = np.empty_like(x)
 
         for i in range(n):
-            # envelope follower (per channel)
             row = x[i]
-            for ch in range(C):
-                a = atk if abs(float(row[ch])) > float(env[ch]) else rel
-                env_ch = a * float(env[ch]) + (1.0 - a) * abs(float(row[ch]))
-                env[ch] = 0.0 if env_ch < tiny else env_ch
-
             if self.stereo_link and C > 1:
-                # compute linked GR target (most negative / strongest reduction)
-                link_gr = 0.0
-                first = True
+                peak = float(np.max(np.abs(row)))
                 for ch in range(C):
-                    lvl = 20.0 * math.log10(max(float(env[ch]), _DEF_EPS))
-                    g = self._soft_knee_gr_db_scalar(lvl, T, R, K)
-                    if first or g < link_gr:
-                        link_gr = g
-                        first = False
-
-                inst = float(link_gr)
-                for ch in range(C):
-                    a = gatk if inst < float(gr_db[ch]) else grel
-                    gr = a * float(gr_db[ch]) + (1.0 - a) * inst
-                    gr_db[ch] = gr
-
-                    gain = mk * math.pow(10.0, gr / 20.0)
-                    out[i, ch] = float(row[ch]) * float(gain)
+                    coeff = atk if peak > self._env[ch] else rel
+                    self._env[ch] = coeff * self._env[ch] + (1.0 - coeff) * peak
+                env = float(np.max(self._env))
+                over = _lin_to_db(env) - self.th
+                gr_db = -max(0.0, over) * (1.0 - 1.0 / self.ratio)
+                gain = _db_to_lin(gr_db) * mk
+                out[i] = row * gain
             else:
                 for ch in range(C):
-                    lvl = 20.0 * math.log10(max(float(env[ch]), _DEF_EPS))
-                    inst = self._soft_knee_gr_db_scalar(lvl, T, R, K)
+                    p = abs(float(row[ch]))
+                    coeff = atk if p > self._env[ch] else rel
+                    self._env[ch] = coeff * self._env[ch] + (1.0 - coeff) * p
+                    over = _lin_to_db(float(self._env[ch])) - self.th
+                    gr_db = -max(0.0, over) * (1.0 - 1.0 / self.ratio)
+                    out[i, ch] = row[ch] * _db_to_lin(gr_db) * mk
 
-                    a = gatk if inst < float(gr_db[ch]) else grel
-                    gr = a * float(gr_db[ch]) + (1.0 - a) * float(inst)
-                    gr_db[ch] = gr
+        return _safe_audio(out)
 
-                    gain = mk * math.pow(10.0, gr / 20.0)
-                    out[i, ch] = float(row[ch]) * float(gain)
+    def process(self, block: np.ndarray, sr: int) -> np.ndarray:
+        x = _ensure_2d(block)
 
-        # safety + clip
-        if not np.all(np.isfinite(out)):
-            out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        if self._native is not None:
+            try:
+                return _safe_audio(self._native.process(x, sr))
+            except Exception:
+                self._native = None
 
-        np.clip(out, -1.0, 1.0, out=out)
-        return out
+        return self._fallback_process(x, sr)
 
 
 @register_filter(
     "limiter",
-    help="Peak limiter. Params: ceiling_db(-1) release_ms(50)",
+    help="Fast peak limiter. Params: ceiling_db(-1) release_ms(50)",
     params=[
-        ParamSpec("ceiling_db", kind="float", default=-1.0, minimum=-18.0, maximum=0.0, step=0.5, scale="db", unit="dB"),
+        ParamSpec("ceiling_db", kind="float", default=-1.0, minimum=-24.0, maximum=0.0, step=0.1, scale="db", unit="dB"),
         ParamSpec("release_ms", kind="float", default=50.0, minimum=1.0, maximum=2000.0, step=1.0, unit="ms"),
     ],
 )
 class Limiter(AudioFilter):
-    """
-    Fast peak limiter:
-      - scalar envelope (shared across channels via peak)
-      - NO per-sample numpy ops/allocs
-    """
     def __init__(self, params: Union[Dict[str, Any], None] = None, **kwargs: Any):
         p = dict(params or {})
         p.update(kwargs)
+
         self.ceil_db = float(p.get("ceiling_db", -1.0))
         self.rel_ms = float(p.get("release_ms", 50.0))
+        self._env = 1.0
+        self._ceil_lin = _db_to_lin(self.ceil_db)
+        self._native = None
 
-        self._env: float = 1.0
-        self._rel_alpha: float = 0.0
-        self._ceil_lin: float = _db_to_lin(self.ceil_db)
-        self._sr: Optional[int] = None
+        if _NATIVE_OK and _NativeLimiter is not None:
+            try:
+                self._native = _NativeLimiter(
+                    ceiling_db=self.ceil_db,
+                    attack_ms=0.1,
+                    release_ms=self.rel_ms,
+                )
+            except Exception:
+                self._native = None
 
     def set_params(self, **kwargs: Any) -> None:
         if "ceiling_db" in kwargs and kwargs["ceiling_db"] is not None:
@@ -716,105 +707,54 @@ class Limiter(AudioFilter):
             self._ceil_lin = _db_to_lin(self.ceil_db)
         if "release_ms" in kwargs and kwargs["release_ms"] is not None:
             self.rel_ms = float(kwargs["release_ms"])
-            self._sr = None
 
-    def _ensure(self, sr: int) -> None:
-        if self._sr != sr:
-            self._sr = sr
-            sr = int(max(1, sr))
-            tau = max(1e-4, float(self.rel_ms) * 1e-3)
-            self._rel_alpha = float(math.exp(-1.0 / (tau * sr)))
+        if self._native is not None:
+            try:
+                self._native.set_params(
+                    ceiling_db=self.ceil_db,
+                    attack_ms=0.1,
+                    release_ms=self.rel_ms,
+                )
+            except Exception:
+                self._native = None
 
     def process(self, block: np.ndarray, sr: int) -> np.ndarray:
-        x = block.astype(np.float32, copy=False)
-        n, C = x.shape
-        if n == 0:
-            return x
+        x = _ensure_2d(block)
 
-        self._ensure(sr)
-        rel = float(self._rel_alpha)
+        if self._native is not None:
+            try:
+                return _safe_audio(self._native.process(x, sr), ceiling=1.0)
+            except Exception:
+                self._native = None
+
+        rel = math.exp(-1.0 / (max(0.1, self.rel_ms) * 1e-3 * max(1, sr)))
+        out = np.empty_like(x)
+        env = float(self._env)
         ceil_lin = float(self._ceil_lin)
 
-        out = np.empty_like(x, dtype=np.float32)
-        env = float(self._env)
-
-        for i in range(n):
+        for i in range(x.shape[0]):
             env *= rel
-
-            # peak across channels (no allocations)
-            row = x[i]
-            peak = 0.0
-            for ch in range(C):
-                v = abs(float(row[ch]))
-                if v > peak:
-                    peak = v
-
+            peak = float(np.max(np.abs(x[i])))
             needed = peak / max(ceil_lin, _DEF_EPS)
             if needed > 1.0 and needed > env:
                 env = needed
-
             gain = 1.0 / (env if env > 1.0 else 1.0)
-            for ch in range(C):
-                out[i, ch] = float(row[ch]) * float(gain)
+            out[i] = x[i] * gain
 
         self._env = env
-        np.clip(out, -ceil_lin, ceil_lin, out=out)
-        return out
+        return _safe_audio(out, ceiling=ceil_lin)
+
 
 @register_filter(
     "mixdown",
-    help=(
-        "Stereo→Mono mixdown. "
-        "Params: mode(average|sum|mid|left|right), "
-        "pan_law_db(-3), normalize(false), norm_target_db(-1), norm_max_boost_db(6), ramp_ms(5)"
-    ),
+    help="Stereo→Mono mixdown. Params: mode(average|sum|mid|left|right), pan_law_db(-3), normalize(false), norm_target_db(-1), norm_max_boost_db(6), ramp_ms(5)",
     params=[
-        ParamSpec(
-            "mode",
-            kind="enum",
-            default="average",
-            choices=["average", "sum", "mid", "left", "right"],
-        ),
-        ParamSpec(
-            "pan_law_db",
-            kind="float",
-            default=-3.0,
-            minimum=-6.0,
-            maximum=0.0,
-            step=0.5,
-            scale="db",
-            unit="dB",
-        ),
+        ParamSpec("mode", kind="enum", default="average", choices=["average", "sum", "mid", "left", "right"]),
+        ParamSpec("pan_law_db", kind="float", default=-3.0, minimum=-6.0, maximum=0.0, step=0.5, scale="db", unit="dB"),
         ParamSpec("normalize", kind="bool", default=False),
-        ParamSpec(
-            "norm_target_db",
-            kind="float",
-            default=-1.0,
-            minimum=-12.0,
-            maximum=-0.1,
-            step=0.1,
-            scale="db",
-            unit="dB",
-        ),
-        ParamSpec(
-            "norm_max_boost_db",
-            kind="float",
-            default=6.0,
-            minimum=0.0,
-            maximum=24.0,
-            step=0.5,
-            scale="db",
-            unit="dB",
-        ),
-        ParamSpec(
-            "ramp_ms",
-            kind="float",
-            default=5.0,
-            minimum=0.1,
-            maximum=50.0,
-            step=0.1,
-            unit="ms",
-        ),
+        ParamSpec("norm_target_db", kind="float", default=-1.0, minimum=-12.0, maximum=-0.1, step=0.1, scale="db", unit="dB"),
+        ParamSpec("norm_max_boost_db", kind="float", default=6.0, minimum=0.0, maximum=24.0, step=0.5, scale="db", unit="dB"),
+        ParamSpec("ramp_ms", kind="float", default=5.0, minimum=0.1, maximum=50.0, step=0.1, unit="ms"),
     ],
 )
 class Mixdown(AudioFilter):
@@ -824,39 +764,28 @@ class Mixdown(AudioFilter):
 
         self.mode = str(p.get("mode", "average")).lower()
         self.pan_law_db = float(p.get("pan_law_db", -3.0))
-
         self.normalize = bool(p.get("normalize", False))
         self.norm_target_db = float(p.get("norm_target_db", -1.0))
         self.norm_max_boost_db = float(p.get("norm_max_boost_db", 6.0))
-
         self.ramp_ms = float(p.get("ramp_ms", 5.0))
-
-        # Smooth gain stages (click-free)
         self._pan_gain = SmoothGain(1.0, ramp_ms=self.ramp_ms)
         self._norm_gain = SmoothGain(1.0, ramp_ms=self.ramp_ms)
 
     def set_params(self, **kwargs):
-        if "mode" in kwargs and kwargs["mode"] is not None:
-            self.mode = str(kwargs["mode"]).lower()
-        if "pan_law_db" in kwargs and kwargs["pan_law_db"] is not None:
-            self.pan_law_db = float(kwargs["pan_law_db"])
+        for k, v in kwargs.items():
+            if v is None:
+                continue
+            if k == "mode":
+                self.mode = str(v).lower()
+            elif hasattr(self, k):
+                setattr(self, k, v)
 
-        if "normalize" in kwargs and kwargs["normalize"] is not None:
-            self.normalize = bool(kwargs["normalize"])
-        if "norm_target_db" in kwargs and kwargs["norm_target_db"] is not None:
-            self.norm_target_db = float(kwargs["norm_target_db"])
-        if "norm_max_boost_db" in kwargs and kwargs["norm_max_boost_db"] is not None:
-            self.norm_max_boost_db = float(kwargs["norm_max_boost_db"])
-
-        if "ramp_ms" in kwargs and kwargs["ramp_ms"] is not None:
-            self.ramp_ms = float(kwargs["ramp_ms"])
-            self._pan_gain._ramp_ms = self.ramp_ms
-            self._norm_gain._ramp_ms = self.ramp_ms
+        self._pan_gain._ramp_ms = self.ramp_ms
+        self._norm_gain._ramp_ms = self.ramp_ms
 
     def process(self, block: np.ndarray, sr: int) -> np.ndarray:
-        x = block.astype(np.float32, copy=False)
+        x = _ensure_2d(block)
 
-        # Already mono → passthrough
         if x.shape[1] == 1:
             return x
 
@@ -868,55 +797,42 @@ class Mixdown(AudioFilter):
         elif self.mode == "right":
             mono = R
         elif self.mode == "mid":
-            mono = (L + R) * 0.70710678  # 1/sqrt(2)
+            mono = (L + R) * 0.70710678
         elif self.mode == "sum":
             mono = L + R
-        else:  # average
+        else:
             mono = 0.5 * (L + R)
 
-        # Pan-law compensation (sum/average only)
         if self.mode in ("sum", "average"):
-            pan_gain = 10.0 ** (self.pan_law_db / 20.0)
-            self._pan_gain.set_params(lin=pan_gain)
+            self._pan_gain.set_params(lin=_db_to_lin(self.pan_law_db))
             mono = self._pan_gain.process(mono[:, None], sr)[:, 0]
 
-        # SAFE normalization:
-        # - normalize to a target peak (e.g. -1 dBFS)
-        # - limit maximum boost so it can’t explode loudness
         if self.normalize:
-            peak = float(np.max(np.abs(mono)))
+            peak = float(np.max(np.abs(mono))) if mono.size else 0.0
             if peak > 1e-9:
-                target_lin = 10.0 ** (self.norm_target_db / 20.0)
+                target_lin = _db_to_lin(self.norm_target_db)
                 desired = target_lin / peak
-
-                # clamp boost (only clamp *upwards*, never force attenuation)
-                max_boost_lin = 10.0 ** (max(0.0, self.norm_max_boost_db) / 20.0)
                 if desired > 1.0:
-                    desired = min(desired, max_boost_lin)
-
+                    desired = min(desired, _db_to_lin(max(0.0, self.norm_max_boost_db)))
                 self._norm_gain.set_params(lin=float(desired))
                 mono = self._norm_gain.process(mono[:, None], sr)[:, 0]
 
-        mono = np.clip(mono, -1.0, 1.0)
-        return mono[:, None].astype(np.float32, copy=False)
+        return _safe_audio(mono[:, None])
 
-# =============================================================================
-# ParametricEQ (GUI-friendly fixed bands + backwards-compatible eq.bandN.*)
-# =============================================================================
 
 _EQ_TYPES = ["peak", "lowshelf", "highshelf", "lowpass", "highpass"]
+
 
 def _read_bool(v: Any, default: bool = False) -> bool:
     if isinstance(v, str):
         return v.strip().lower() in ("1", "true", "yes", "on")
     return bool(v) if v is not None else default
 
+
 @register_filter(
     "parametriceq",
-    help=("Parametric EQ (4 bands + legacy eq.bandN.*). "
-          "Params: b1_type,b1_freq,b1_gain_db,b1_q,b1_slope,b1_order ... b4_*"),
+    help="Parametric EQ (4 bands + legacy eq.bandN.*). Params: b1_type,b1_freq,b1_gain_db,b1_q,b1_slope,b1_order ... b4_*",
     params=[
-        # Band 1
         ParamSpec("b1_type", kind="enum", default="peak", choices=_EQ_TYPES),
         ParamSpec("b1_freq", kind="float", default=120.0, minimum=20.0, maximum=24000.0, step=1.0, scale="log", unit="Hz"),
         ParamSpec("b1_gain_db", kind="float", default=0.0, minimum=-24.0, maximum=24.0, step=0.5, scale="db", unit="dB"),
@@ -924,7 +840,6 @@ def _read_bool(v: Any, default: bool = False) -> bool:
         ParamSpec("b1_slope", kind="float", default=1.0, minimum=0.1, maximum=4.0, step=0.05),
         ParamSpec("b1_order", kind="int", default=2, minimum=1, maximum=8, step=1),
         ParamSpec("b1_enable", kind="bool", default=True),
-        # Band 2
         ParamSpec("b2_type", kind="enum", default="peak", choices=_EQ_TYPES),
         ParamSpec("b2_freq", kind="float", default=600.0, minimum=20.0, maximum=24000.0, step=1.0, scale="log", unit="Hz"),
         ParamSpec("b2_gain_db", kind="float", default=0.0, minimum=-24.0, maximum=24.0, step=0.5, scale="db", unit="dB"),
@@ -932,17 +847,15 @@ def _read_bool(v: Any, default: bool = False) -> bool:
         ParamSpec("b2_slope", kind="float", default=1.0, minimum=0.1, maximum=4.0, step=0.05),
         ParamSpec("b2_order", kind="int", default=2, minimum=1, maximum=8, step=1),
         ParamSpec("b2_enable", kind="bool", default=True),
-        # Band 3
         ParamSpec("b3_type", kind="enum", default="peak", choices=_EQ_TYPES),
-        ParamSpec("b3_freq", kind="float", default=2500.0, minimum=20.0, maximum=24000.0, step=1.0, scale="log", unit="Hz"),
+        ParamSpec("b3_freq", kind="float", default=3000.0, minimum=20.0, maximum=24000.0, step=1.0, scale="log", unit="Hz"),
         ParamSpec("b3_gain_db", kind="float", default=0.0, minimum=-24.0, maximum=24.0, step=0.5, scale="db", unit="dB"),
         ParamSpec("b3_q", kind="float", default=1.0, minimum=0.1, maximum=24.0, step=0.05),
         ParamSpec("b3_slope", kind="float", default=1.0, minimum=0.1, maximum=4.0, step=0.05),
         ParamSpec("b3_order", kind="int", default=2, minimum=1, maximum=8, step=1),
         ParamSpec("b3_enable", kind="bool", default=True),
-        # Band 4
         ParamSpec("b4_type", kind="enum", default="highshelf", choices=_EQ_TYPES),
-        ParamSpec("b4_freq", kind="float", default=9000.0, minimum=20.0, maximum=24000.0, step=1.0, scale="log", unit="Hz"),
+        ParamSpec("b4_freq", kind="float", default=10000.0, minimum=20.0, maximum=24000.0, step=1.0, scale="log", unit="Hz"),
         ParamSpec("b4_gain_db", kind="float", default=0.0, minimum=-24.0, maximum=24.0, step=0.5, scale="db", unit="dB"),
         ParamSpec("b4_q", kind="float", default=1.0, minimum=0.1, maximum=24.0, step=0.05),
         ParamSpec("b4_slope", kind="float", default=1.0, minimum=0.1, maximum=4.0, step=0.05),
@@ -950,170 +863,74 @@ def _read_bool(v: Any, default: bool = False) -> bool:
         ParamSpec("b4_enable", kind="bool", default=True),
     ],
 )
-class ParametricEQ(AudioFilter):
+class ParametricEQ(_IIRSOS):
     def __init__(self, params: Union[Dict[str, Any], None] = None, **kwargs: Any):
-        self._params: Dict[str, Any] = dict(params or {})
-        self._params.update(kwargs)
-
-        self._sr: Optional[int] = None
-        self._C: Optional[int] = None
-        self._built = False
-
-        self._bands_sos: List[np.ndarray] = []
-        self._bands_zi: List[np.ndarray] = []
-
-        # legacy eq.bandN.* support
-        self._legacy_defs: List[Dict[str, Any]] = []
-        self._parse_legacy_bands()
+        super().__init__()
+        self.params: Dict[str, Any] = dict(params or {})
+        self.params.update(kwargs)
 
     def set_params(self, **kwargs: Any) -> None:
-        # update without wiping state unless design needs rebuild
-        changed = False
-        for k, v in kwargs.items():
-            if self._params.get(k) != v:
-                self._params[k] = v
-                changed = True
-        if changed:
-            self._built = False
+        self.params.update(kwargs)
+        self._initd = False
 
-    def _parse_legacy_bands(self):
-        self._legacy_defs = []
-        pat = re.compile(r"eq\.band(\d+)\.(type|freq|gain_db|q|slope|order|enable)$")
-        tmp: Dict[int, Dict[str, Any]] = {}
-        for k, v in self._params.items():
-            m = pat.match(str(k))
-            if not m:
-                continue
-            bi = int(m.group(1))
-            pn = m.group(2)
-            tmp.setdefault(bi, {})[pn] = v
+    def _band_sos(self, sr: int, idx: int) -> Optional[np.ndarray]:
+        p = self.params
+        prefix = f"b{idx}_"
 
-        for bi in sorted(tmp.keys()):
-            d = tmp[bi]
-            if "type" not in d or "freq" not in d:
-                continue
-            d.setdefault("q", 1.0)
-            d.setdefault("slope", 1.0)
-            d.setdefault("order", 2)
-            d.setdefault("enable", True)
-            self._legacy_defs.append(d)
+        enabled = _read_bool(p.get(prefix + "enable", True), True)
+        if not enabled:
+            return None
 
-    def _fixed_band_defs(self) -> List[Dict[str, Any]]:
-        defs: List[Dict[str, Any]] = []
+        typ = str(p.get(prefix + "type", "peak")).lower()
+        freq = float(p.get(prefix + "freq", [120, 600, 3000, 10000][idx - 1]))
+        gain = float(p.get(prefix + "gain_db", 0.0))
+        q = float(p.get(prefix + "q", 1.0))
+        slope = float(p.get(prefix + "slope", 1.0))
+        order = int(p.get(prefix + "order", 2))
+
+        nyq = max(1.0, 0.5 * sr)
+
+        if typ == "peak":
+            return _iir_peaking_sos(sr, freq, q, gain)
+        if typ in ("lowshelf", "low"):
+            return _iir_shelf_sos(sr, freq, gain, shelf_type="low", slope=slope)
+        if typ in ("highshelf", "high"):
+            return _iir_shelf_sos(sr, freq, gain, shelf_type="high", slope=slope)
+        if typ == "lowpass":
+            wn = _clamp(freq / nyq, 1e-5, 0.9999)
+            return signal.butter(int(max(1, min(8, order))), wn, btype="low", output="sos")
+        if typ == "highpass":
+            wn = _clamp(freq / nyq, 1e-5, 0.9999)
+            return signal.butter(int(max(1, min(8, order))), wn, btype="high", output="sos")
+
+        return None
+
+    def _design(self, sr: int) -> np.ndarray:
+        parts = []
+
         for i in range(1, 5):
-            enable = _read_bool(self._params.get(f"b{i}_enable", True), True)
-            if not enable:
-                continue
-            defs.append({
-                "type": str(self._params.get(f"b{i}_type", "peak")).lower(),
-                "freq": float(self._params.get(f"b{i}_freq", 1000.0)),
-                "gain_db": float(self._params.get(f"b{i}_gain_db", 0.0)),
-                "q": float(self._params.get(f"b{i}_q", 1.0)),
-                "slope": float(self._params.get(f"b{i}_slope", 1.0)),
-                "order": int(self._params.get(f"b{i}_order", 2)),
-            })
-        return defs
+            sos = self._band_sos(sr, i)
+            if sos is not None:
+                parts.append(sos)
 
-    def _build(self, sr: int, C: int):
-        self._bands_sos = []
-        self._bands_zi = []
-        self._sr, self._C = sr, C
+        if not parts:
+            return np.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=np.float64)
 
-        # prefer legacy if present; else fixed 4-band GUI controls
-        self._parse_legacy_bands()
-        band_defs = self._legacy_defs if self._legacy_defs else self._fixed_band_defs()
+        return np.vstack(parts)
 
-        for bd in band_defs:
-            b_type = str(bd.get("type", "peak")).lower()
-            b_freq = float(bd.get("freq", 1000.0))
-            b_gain = float(bd.get("gain_db", 0.0))
-            b_q = float(bd.get("q", 1.0))
-            b_slope = float(bd.get("slope", 1.0))
-            b_order = int(bd.get("order", 2))
-
-            sos: Optional[np.ndarray] = None
-
-            if b_type == "peak":
-                sos = _iir_peaking_sos(sr, b_freq, b_q, b_gain)
-            elif b_type == "lowshelf":
-                sos = _iir_shelf_sos(sr, b_freq, b_gain, shelf_type="low", slope=b_slope)
-            elif b_type == "highshelf":
-                sos = _iir_shelf_sos(sr, b_freq, b_gain, shelf_type="high", slope=b_slope)
-            elif b_type == "lowpass":
-                wn = _clamp(b_freq / (0.5 * sr), 1e-5, 0.9999)
-                sos = signal.butter(int(max(1, min(8, b_order))), wn, btype="low", output="sos")
-            elif b_type == "highpass":
-                wn = _clamp(b_freq / (0.5 * sr), 1e-5, 0.9999)
-                sos = signal.butter(int(max(1, min(8, b_order))), wn, btype="high", output="sos")
-
-            if sos is None or sos.ndim != 2 or sos.shape[1] != 6:
-                continue
-
-            sos64 = sos.astype(np.float64, copy=False)
-            zi_one = signal.sosfilt_zi(sos64)  # (S,2)
-            zi = np.tile(zi_one[..., np.newaxis], (1, 1, C)).astype(np.float64)  # (S,2,C)
-
-            self._bands_sos.append(sos64)
-            self._bands_zi.append(zi)
-
-        self._built = bool(self._bands_sos)
-
-    def _ensure(self, sr: int, C: int):
-        if (not self._built) or (self._sr != sr) or (self._C != C):
-            self._build(sr, C)
-
-    def process(self, block: np.ndarray, sr: int) -> np.ndarray:
-        x = block.astype(np.float64, copy=False)
-        n, C = x.shape
-        if n == 0:
-            return block.astype(np.float32, copy=False)
-
-        self._ensure(sr, C)
-        if not self._built:
-            return block.astype(np.float32, copy=False)
-
-        y = x
-        for i in range(len(self._bands_sos)):
-            sos = self._bands_sos[i]
-            zi = self._bands_zi[i]
-            # zi expected (S,2,C) for axis=0 filtering on (N,C)
-            y, self._bands_zi[i] = signal.sosfilt(sos, y, axis=0, zi=zi)
-
-        y = y.astype(np.float32, copy=False)
-        if not np.all(np.isfinite(y)):
-            y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-        return np.clip(y, -1.0, 1.0).astype(np.float32, copy=False)
-
-
-# =============================================================================
-# Master (declares ALL params so your GUI can build them reliably)
-# =============================================================================
 
 @register_filter(
     "master",
-    help=("Mastering: HPF + 3-band comp + limiter. "
-          "Params: low_cut(30) x1(200) x2(4000) order(2) "
-          "low_th(-24) low_ratio(2) mid_th(-20) mid_ratio(2.5) high_th(-22) high_ratio(2) "
-          "attack_ms(5) release_ms(60) makeup_db(1) ceiling_db(-1)"),
+    help="Master chain: low cut, multiband compression, limiter. Params: low_cut,x1,x2,order,attack_ms,release_ms,makeup_db,ceiling_db",
     params=[
-        ParamSpec("low_cut", kind="float", default=30.0, minimum=10.0, maximum=400.0, step=1.0, scale="log", unit="Hz"),
-        ParamSpec("x1", kind="float", default=200.0, minimum=50.0, maximum=2000.0, step=1.0, scale="log", unit="Hz"),
-        ParamSpec("x2", kind="float", default=4000.0, minimum=1000.0, maximum=18000.0, step=1.0, scale="log", unit="Hz"),
+        ParamSpec("low_cut", kind="float", default=30.0, minimum=10.0, maximum=300.0, step=1.0, scale="log", unit="Hz"),
+        ParamSpec("x1", kind="float", default=200.0, minimum=40.0, maximum=2000.0, step=1.0, scale="log", unit="Hz"),
+        ParamSpec("x2", kind="float", default=4000.0, minimum=500.0, maximum=16000.0, step=1.0, scale="log", unit="Hz"),
         ParamSpec("order", kind="int", default=2, minimum=1, maximum=8, step=1),
-
-        ParamSpec("low_th", kind="float", default=-24.0, minimum=-60.0, maximum=0.0, step=0.5, scale="db", unit="dB"),
-        ParamSpec("low_ratio", kind="float", default=2.0, minimum=1.0, maximum=10.0, step=0.1),
-
-        ParamSpec("mid_th", kind="float", default=-20.0, minimum=-60.0, maximum=0.0, step=0.5, scale="db", unit="dB"),
-        ParamSpec("mid_ratio", kind="float", default=2.5, minimum=1.0, maximum=10.0, step=0.1),
-
-        ParamSpec("high_th", kind="float", default=-22.0, minimum=-60.0, maximum=0.0, step=0.5, scale="db", unit="dB"),
-        ParamSpec("high_ratio", kind="float", default=2.0, minimum=1.0, maximum=10.0, step=0.1),
-
         ParamSpec("attack_ms", kind="float", default=5.0, minimum=0.1, maximum=200.0, step=0.1, unit="ms"),
         ParamSpec("release_ms", kind="float", default=60.0, minimum=1.0, maximum=2000.0, step=1.0, unit="ms"),
-        ParamSpec("makeup_db", kind="float", default=1.0, minimum=-12.0, maximum=24.0, step=0.5, scale="db", unit="dB"),
-        ParamSpec("ceiling_db", kind="float", default=-1.0, minimum=-18.0, maximum=0.0, step=0.5, scale="db", unit="dB"),
+        ParamSpec("makeup_db", kind="float", default=1.0, minimum=-12.0, maximum=12.0, step=0.5, scale="db", unit="dB"),
+        ParamSpec("ceiling_db", kind="float", default=-1.0, minimum=-12.0, maximum=0.0, step=0.1, scale="db", unit="dB"),
     ],
 )
 class Master(AudioFilter):
@@ -1121,157 +938,47 @@ class Master(AudioFilter):
         self.params: Dict[str, Any] = dict(params or {})
         self.params.update(kwargs)
 
-        self._sr: Optional[int] = None
-        self._C: Optional[int] = None
-
-        self._hpf: Optional[Highpass] = None
-        self._lp: Optional[Lowpass] = None
-        self._bp: Optional[Bandpass] = None
-        self._hp: Optional[Highpass] = None
-
-        self._cL: Optional[Compressor] = None
-        self._cM: Optional[Compressor] = None
-        self._cH: Optional[Compressor] = None
-        self._cl: Optional[Limiter] = None
-
-        self._mk: SmoothGain = SmoothGain(1.0, ramp_ms=10.0)
-
-        self._mix_buf: Optional[np.ndarray] = None
-        self._dirty: bool = True
-        self._applied: Dict[str, Any] = {}
+        self._hpf = Highpass({"cutoff": float(self.params.get("low_cut", 30.0)), "order": int(self.params.get("order", 2))})
+        self._comp = Compressor(
+            {
+                "threshold_db": float(self.params.get("threshold_db", -18.0)),
+                "ratio": float(self.params.get("ratio", 2.0)),
+                "attack_ms": float(self.params.get("attack_ms", 5.0)),
+                "release_ms": float(self.params.get("release_ms", 60.0)),
+                "makeup_db": float(self.params.get("makeup_db", 1.0)),
+                "knee_db": 6.0,
+                "stereo_link": True,
+            }
+        )
+        self._lim = Limiter(
+            {
+                "ceiling_db": float(self.params.get("ceiling_db", -1.0)),
+                "release_ms": float(self.params.get("limiter_release_ms", 80.0)),
+            }
+        )
 
     def set_params(self, **kwargs: Any) -> None:
-        for k, v in kwargs.items():
-            self.params[k] = v
-        self._dirty = True
+        self.params.update(kwargs)
 
-    def _get_cfg(self) -> Dict[str, Any]:
-        # read + sanitize
-        low_cut = float(self.params.get("low_cut", 30.0))
-        x1 = float(self.params.get("x1", 200.0))
-        x2 = float(self.params.get("x2", 4000.0))
-        order = int(self.params.get("order", 2))
-
-        atk = float(self.params.get("attack_ms", 5.0))
-        rel = float(self.params.get("release_ms", 60.0))
-        makeup_db = float(self.params.get("makeup_db", 1.0))
-        ceiling_db = float(self.params.get("ceiling_db", -1.0))
-
-        low_th = float(self.params.get("low_th", -24.0))
-        mid_th = float(self.params.get("mid_th", -20.0))
-        high_th = float(self.params.get("high_th", -22.0))
-
-        low_ratio = float(self.params.get("low_ratio", 2.0))
-        mid_ratio = float(self.params.get("mid_ratio", 2.5))
-        high_ratio = float(self.params.get("high_ratio", 2.0))
-
-        # basic guards
-        low_cut = max(10.0, low_cut)
-        x1 = max(20.0, x1)
-        x2 = max(x1 + 20.0, x2)
-        order = int(max(1, min(8, order)))
-
-        return {
-            "low_cut": low_cut,
-            "x1": x1,
-            "x2": x2,
-            "order": order,
-            "atk": atk,
-            "rel": rel,
-            "makeup_db": makeup_db,
-            "ceiling_db": ceiling_db,
-            "low_th": low_th,
-            "mid_th": mid_th,
-            "high_th": high_th,
-            "low_ratio": low_ratio,
-            "mid_ratio": mid_ratio,
-            "high_ratio": high_ratio,
-        }
-
-    def _ensure(self, sr: int, C: int) -> None:
-        # build once
-        if self._hpf is None:
-            self._hpf = Highpass({"cutoff": 30.0, "order": 2})
-            self._lp = Lowpass({"cutoff": 200.0, "order": 2})
-            self._bp = Bandpass({"low": 200.0, "high": 4000.0, "order": 2})
-            self._hp = Highpass({"cutoff": 4000.0, "order": 2})
-
-            shared = {"attack_ms": 5.0, "release_ms": 60.0, "makeup_db": 0.0, "knee_db": 6.0, "stereo_link": True}
-            self._cL = Compressor({"threshold_db": -24.0, "ratio": 2.0, **shared})
-            self._cM = Compressor({"threshold_db": -20.0, "ratio": 2.5, **shared})
-            self._cH = Compressor({"threshold_db": -22.0, "ratio": 2.0, **shared})
-            self._cl = Limiter({"ceiling_db": -1.0, "release_ms": 80.0})
-
-            self._dirty = True
-            self._applied = {}
-
-        self._sr, self._C = sr, C
-
-        if not self._dirty:
-            return
-
-        cfg = self._get_cfg()
-
-        # Only push changes when they actually changed (prevents constant redesign)
-        def changed(k: str) -> bool:
-            return self._applied.get(k) != cfg[k]
-
-        # filters
-        if changed("low_cut"):
-            self._hpf.set_params(cutoff=cfg["low_cut"])
-        if changed("x1") or changed("order"):
-            self._lp.set_params(cutoff=cfg["x1"], order=cfg["order"])
-        if changed("x1") or changed("x2") or changed("order"):
-            self._bp.set_params(low=cfg["x1"], high=cfg["x2"], order=cfg["order"])
-        if changed("x2") or changed("order"):
-            self._hp.set_params(cutoff=cfg["x2"], order=cfg["order"])
-
-        # compressors (don’t reset state; just update params)
-        shared_comp = {"attack_ms": cfg["atk"], "release_ms": cfg["rel"], "makeup_db": 0.0, "knee_db": 6.0, "stereo_link": True}
-        if changed("low_th") or changed("low_ratio") or changed("atk") or changed("rel"):
-            self._cL.set_params(threshold_db=cfg["low_th"], ratio=cfg["low_ratio"], **shared_comp)
-        if changed("mid_th") or changed("mid_ratio") or changed("atk") or changed("rel"):
-            self._cM.set_params(threshold_db=cfg["mid_th"], ratio=cfg["mid_ratio"], **shared_comp)
-        if changed("high_th") or changed("high_ratio") or changed("atk") or changed("rel"):
-            self._cH.set_params(threshold_db=cfg["high_th"], ratio=cfg["high_ratio"], **shared_comp)
-
-        # limiter + makeup
-        if changed("ceiling_db"):
-            self._cl.set_params(ceiling_db=cfg["ceiling_db"])
-        if changed("makeup_db"):
-            self._mk.set_params(db=cfg["makeup_db"])
-
-        self._applied = cfg
-        self._dirty = False
+        self._hpf.set_params(
+            cutoff=float(self.params.get("low_cut", 30.0)),
+            order=int(self.params.get("order", 2)),
+        )
+        self._comp.set_params(
+            threshold_db=float(self.params.get("threshold_db", -18.0)),
+            ratio=float(self.params.get("ratio", 2.0)),
+            attack_ms=float(self.params.get("attack_ms", 5.0)),
+            release_ms=float(self.params.get("release_ms", 60.0)),
+            makeup_db=float(self.params.get("makeup_db", 1.0)),
+        )
+        self._lim.set_params(
+            ceiling_db=float(self.params.get("ceiling_db", -1.0)),
+            release_ms=float(self.params.get("limiter_release_ms", 80.0)),
+        )
 
     def process(self, block: np.ndarray, sr: int) -> np.ndarray:
-        x = block.astype(np.float32, copy=False)
-        n, C = x.shape
-        if n == 0:
-            return x
-
-        self._ensure(sr, C)
-
-        if self._mix_buf is None or self._mix_buf.shape != (n, C):
-            self._mix_buf = np.empty((n, C), dtype=np.float32)
-
-        assert self._hpf and self._lp and self._bp and self._hp and self._cL and self._cM and self._cH and self._cl
-
-        y = self._hpf.process(x, sr)
-        low = self._lp.process(y, sr)
-        mid = self._bp.process(y, sr)
-        high = self._hp.process(y, sr)
-
-        low = self._cL.process(low, sr)
-        mid = self._cM.process(mid, sr)
-        high = self._cH.process(high, sr)
-
-        np.add(low, mid, out=self._mix_buf)
-        self._mix_buf += high
-
-        mk_applied = self._mk.process(self._mix_buf, sr)
-        out = self._cl.process(mk_applied, sr)
-
-        out = _soft_clip(out)
-        np.clip(out, -1.0, 1.0, out=out)
-        return out.astype(np.float32, copy=False)
+        y = _ensure_2d(block)
+        y = self._hpf.process(y, sr)
+        y = self._comp.process(y, sr)
+        y = self._lim.process(y, sr)
+        return _safe_audio(y)

@@ -25,6 +25,8 @@ added_files = [
     ("clarity.py", "."),
     ("helpers.py", "."),
     ("stream.py", "."),
+    ("vocals.py", "."),
+    ("native.py", "."),
 ] + scipy_datas
 
 # sounddevice libs
@@ -34,7 +36,7 @@ a = Analysis(
     ["main.py"],
     pathex=[],
     # 4. Combine sounddevice libs with our new FFmpeg binaries
-    binaries=sd_binaries + ffmpeg_binaries,
+    binaries=sd_binaries + ffmpeg_binaries + ["AudioProject.dll"],
     datas=added_files,
     hiddenimports=[
         "numpy",
